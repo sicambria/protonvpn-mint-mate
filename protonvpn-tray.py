@@ -637,6 +637,13 @@ class ProtonVPNTray:
         parent_menu.append(parent)
 
     def _make_setting_handler(self, key, value):
+        def on_done(ret, out, err, _key=key):
+            if ret == 0:
+                self._config_cache.pop(_key, None)
+                notify("VPN Settings", "%s set to %s" % (_key, value))
+            else:
+                notify("VPN Settings", "Failed: " + (err or out)[:80])
+
         def handler(widget):
             if not widget.get_active():
                 return
@@ -644,11 +651,7 @@ class ProtonVPNTray:
                 ["config", "set", key, value],
                 CMD_TIMEOUT_CONFIG_SET,
                 "Setting %s to %s" % (key, value),
-                on_done=lambda ret, out, err: (
-                    notify("VPN Settings", "%s set to %s" % (key, value))
-                    if ret == 0
-                    else notify("VPN Settings", "Failed: " + (err or out)[:80])
-                ),
+                on_done=on_done,
             )
         return handler
 
@@ -974,6 +977,7 @@ class ProtonVPNTray:
                 ]
                 self.config["favorites"] = selected
                 self._save_config()
+                self._rebuild_all_submenus()
                 notify("Favorites", "Updated (%d favorites)" % len(selected))
             elif proc.returncode == 1:
                 pass
