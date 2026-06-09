@@ -58,85 +58,111 @@ When the user manager is killed, it takes down the entire user cgroup: Xorg, the
 
 ## Why Existing Mitigations Weren't Enough
 
-Three defenses were already in place:
+Three defenses were already in place, plus the circuit breaker had a critical bug:
 
 | Defense | Mechanism | Why it helped | Why it wasn't enough |
 |---------|-----------|---------------|---------------------|
 | Global lock (`_cli_lock`) | Serializes all `protonvpn` calls | Prevents concurrent native library access (thread safety) | Only prevents concurrent crashes, not sequential ones |
 | Exponential backoff | `_failure_count > 3` → sleep up to 30s | Slows the crash rate from 12/min to 2/min | Never stops — just slows down |
 | SIGKILL via `os.killpg` | Kills process group on timeout/error | Cleaner process cleanup | The CLI still crashes with SIGABRT before the kill can fire |
+| Circuit breaker (v1) | `_polling_paused` after 10 failures | Should have stopped polling | **Didn't fire** — see next section |
 
-**The fatal gap**: There was no **circuit breaker** — no mechanism to permanently stop polling when the CLI is fundamentally broken. The backoff reduced frequency but never stopped. With `_poll_status` returning `True` every cycle, the GLib timer kept firing indefinitely.
+### The critical bug: SIGABRT looks like success to Python
+
+`proc.communicate()` does **not** raise an exception when the child process is killed by a signal. The child dies, pipes close, Python returns normally with `proc.returncode = -6` (negative of SIGABRT). No `Exception`, no `TimeoutExpired` — just a normal return with a negative code.
+
+The v1 circuit breaker only incremented `_failure_count` inside exception handlers (`except TimeoutExpired`, `except FileNotFoundError`, `except Exception`). A SIGABRT crash hit none of these — it hit the success path which reset `_failure_count = 0`. The counter never reached 10. The breaker never fired.
+
+**48 crashes × 16 MB coredumps = 812 MB** were written across two boots before the bug was found.
 
 ---
 
 ## Fix
 
-### Circuit breaker
+### 1. Signal death detection (critical)
 
-A new module-level flag `_polling_paused` acts as a hard stop. When `_failure_count` reaches `MAX_FAILURES` (10), all status polling ceases:
+The success path in `run_cli` must check `proc.returncode < 0` before resetting the failure counter:
 
 ```python
-_MAX_FAILURES = 10
+out, err = proc.communicate(timeout=timeout)
+if proc.returncode < 0:                          # ← added
+    _failure_count += 1                           # ← added
+    if _failure_count >= _MAX_FAILURES and not _polling_paused:
+        _polling_paused = True                    # ← added
+    log.warning("protonvpn %s killed by signal %d (failure #%d)",
+                " ".join(args), -proc.returncode, _failure_count)
+    return proc.returncode, out.strip(), err.strip()
+_failure_count = 0                                # ← was unconditional
 _polling_paused = False
-
-# In run_cli, after incrementing _failure_count:
-if _failure_count >= _MAX_FAILURES and not _polling_paused:
-    _polling_paused = True
-    log.critical("protonvpn CLI failing repeatedly — polling paused")
+_polling_paused_notified = False
+return proc.returncode, out.strip(), err.strip()
 ```
 
-### Poll guard
+### 2. Circuit breaker
+
+A module-level flag `_polling_paused` acts as a hard stop. When `_failure_count` reaches `_MAX_FAILURES` (10), all status polling ceases.
+
+### 3. Poll guard
 
 `_poll_status()` checks `_polling_paused` before calling `run_cli_async`:
 
 ```python
 def _poll_status(self):
-    if global_state._polling_paused:
+    if _polling_paused:
         return True  # keep timer alive, but don't poll
     ...
 ```
 
-### Auto-recovery
+### 4. Auto-recovery
 
 If the user fixes the CLI issue and a manual VPN action (connect, disconnect, config) succeeds, `_failure_count` resets to 0 and `_polling_paused` is cleared. The next 5-second timer tick resumes normal polling.
 
-```python
-# In run_cli, on success:
-_failure_count = 0
-_polling_paused = False
-```
-
-### User notification
+### 5. User notification
 
 A libnotify notification is sent once when polling is paused:
 > "Proton VPN CLI is not responding. Status polling paused until next manual action succeeds."
 
+### 6. Stale `.pyc` cache (operational)
+
+Python caches compiled bytecode in `__pycache__/protonvpn-tray.cpython-312.pyc`. If the `.py` source mtime matches the `.pyc` embedded mtime, Python uses the cache without recompiling. After a source edit, the `.pyc` must be deleted or recompiled — otherwise the old bytecode runs even after `git commit`. The `install.sh` should be updated to clear the cache on install; for now, manual deletion suffices.
+
 ---
 
-## Timeline (approximate, reconstructed)
+## Timeline (actual, from coredump timestamps)
 
-| T+0s | Login, `protonvpn-tray.py --auto-connect` starts |
-| T+5s | First status poll → `protonvpn status` crashes (SIGABRT in local_agent.abi3.so) |
-| T+10s | Second poll → crash |
-| T+15s | Third poll → crash |
-| T+20s | Fourth poll → crash, backoff begins (1s delay) |
-| T+26s–T+360s | ~30 more crashes with exponential backoff (capped at 30s delay), ~34 coredumps written |
-| T+360s | systemd user manager becomes unresponsive, PID 1 sends SIGKILL |
-| T+360s | Xorg dies, session ends, LightDM greeter appears |
+| Time (CEST) | Event |
+|-------------|-------|
+| **Boot 1 (June 9)** | |
+| 23:48 | Login, tray starts with old code (no circuit breaker) |
+| 23:48–23:59 | ~15 crashes, 16 MB coredumps each |
+| ~23:59 | systemd user manager becomes unresponsive, PID 1 sends SIGKILL |
+| 23:59 | User logged out, drops to LightDM greeter |
+| **Boot 2 (June 10)** | |
+| 00:07 | Login, tray starts with v1 circuit breaker code |
+| 00:07–00:10 | Circuit breaker never fires — SIGABRT hits success path, resets `_failure_count = 0` every time |
+| 00:10+ | ~33 more crashes, 48 total across both boots |
+| 00:10 | **User session alive because I inspect the system during this session** |
+| (ongoing) | Circuit breaker code fixed with `proc.returncode < 0` check |
+
+**Totals: 48 coredumps, ~812 MB written to `/var/lib/systemd/coredump/`**
 
 ---
 
 ## Lessons Learned
 
-1. **Exponential backoff without a ceiling is a delay, not a defense.** A hard stop (circuit breaker) is required when a subsystem is fundamentally broken.
-2. **Poll loops must have a death condition.** A 5-second `GLib.timeout_add_seconds` returning `True` forever is a guaranteed infinite retry loop.
-3. **Process crash storms can cascade to the init system.** systemd's user manager watchdog is a safety net, but triggering it means the user session is already doomed.
-4. **Coredumps are cheap individually but expensive in aggregate.** 34 × 15.8 MB = 622 MB in 6 minutes can overwhelm I/O on slower disks.
-5. **The circuit breaker should be automatic, not config-based.** This should have been the default behavior from day one — no user should need to know to configure a failure limit.
+1. **`proc.communicate()` does not raise on child signal death.** A process killed by SIGABRT/SIGSEGV/SIGKILL looks like a normal exit with a negative return code. Always check `proc.returncode < 0` if the child might crash.
+2. **Exception-based error handling misses signal deaths.** Writing `try: ... except Exception:` gives false confidence — the crash hit neither the try nor any except.
+3. **Coredumps are cheap individually but expensive in aggregate.** 48 × 16 MB = 812 MB filled the coredump directory.
+4. **Python `.pyc` caching can mask code changes.** After editing source, delete `__pycache__/*.pyc` to guarantee the new code runs.
+5. **Poll loops must have a death condition.** A 5-second `GLib.timeout_add_seconds` returning `True` forever is a guaranteed infinite retry loop.
+6. **Process crash storms can cascade to the init system.** systemd's user manager watchdog kills the entire user session — not just the offending service.
+7. **The circuit breaker should be automatic, not config-based.** No user should need to know to configure a failure limit.
 
 ---
 
 ## Files Changed
 
-- `protonvpn-tray.py` — Added `_polling_paused` circuit breaker, `_MAX_FAILURES` constant, poll guard, auto-recovery on manual action success, user notification
+- `protonvpn-tray.py` — Added `proc.returncode < 0` check, `_polling_paused` circuit breaker, `_MAX_FAILURES` constant, poll guard, auto-recovery on manual action success, user notification
+- `pre-commit-hook` — Added `_is_safe_ip()` function covering RFC 1918/5737/6598 ranges; re-synced stale installed hook with `tests/*` skip rule
+- `tests/test_gtk_integration.py` — Safety gate: requires `PROTONVPN_TEST_LIVE=1` env var to run
+- `docs/errors/2026-06/20260609-RCA-systemd-kill-cascade.md` — This document
