@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Proton VPN Tray
+Comment=Proton VPN system tray controller for Linux Mint MATE
+Exec=python3 /INSTALL/PATH/protonvpn-tray.py --auto-connect
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
