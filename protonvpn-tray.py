@@ -79,6 +79,13 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
                 start_new_session=True,
             )
             out, err = proc.communicate(timeout=timeout)
+            if proc.returncode < 0:
+                _failure_count += 1
+                if _failure_count >= _MAX_FAILURES and not _polling_paused:
+                    _polling_paused = True
+                log.warning("protonvpn %s killed by signal %d (failure #%d)",
+                            " ".join(args), -proc.returncode, _failure_count)
+                return proc.returncode, out.strip(), err.strip()
             _failure_count = 0
             _polling_paused = False
             _polling_paused_notified = False

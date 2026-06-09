@@ -15,7 +15,7 @@ import shutil
 import signal
 import time
 import subprocess as real_subprocess
-import webbrowser
+
 from unittest.mock import patch, MagicMock, call
 
 from helpers import load_tray_module, check, heading, summary, make_tray
@@ -916,13 +916,18 @@ with patch("subprocess.run", side_effect=OSError("script missing")), \
 heading("65. _on_about")
 
 t = make_tray(MOD)
-with patch.object(MOD.webbrowser, "open") as mock_web:
+mock_dlg = MagicMock()
+with patch.object(MOD.Gtk, "AboutDialog", return_value=mock_dlg):
     MOD.ProtonVPNTray._on_about(t, None)
-    check("65.1: webbrowser.open called", mock_web.called)
-    url = mock_web.call_args[0][0]
-    check("65.2: correct URL",
-          "github.com/sicambria/protonvpn-mint-mate" in url,
-          "got %s" % url)
+    check("65.1: AboutDialog created", MOD.Gtk.AboutDialog.called)
+    check("65.2: program_name set",
+          mock_dlg.set_program_name.called,
+          str(mock_dlg.set_program_name.call_args))
+    check("65.3: website set",
+          mock_dlg.set_website.called,
+          str(mock_dlg.set_website.call_args))
+    check("65.4: run() called", mock_dlg.run.called)
+    check("65.5: destroy() called", mock_dlg.destroy.called)
 
 # ---------------------------------------------------------------------------
 # 66. main() / argparse
