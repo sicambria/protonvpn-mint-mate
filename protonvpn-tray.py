@@ -169,7 +169,11 @@ def parse_config_list(output):
     return settings
 
 
+_notify_initialized = False
+
 def notify(title, body, icon="network-vpn"):
+    if not _notify_initialized:
+        return
     try:
         n = Notify.Notification.new(title, body, icon)
         n.set_timeout(5000)
@@ -200,6 +204,8 @@ class ProtonVPNTray:
         self._write_pid()
 
         Notify.init("protonvpn-tray")
+        global _notify_initialized
+        _notify_initialized = True
 
         self._create_indicator()
         self.menu = self._build_menu()
@@ -264,6 +270,8 @@ class ProtonVPNTray:
             pass
 
     def _shutdown(self):
+        global _notify_initialized
+        _notify_initialized = False
         self._remove_pid()
         try:
             Notify.uninit()
@@ -851,9 +859,8 @@ class ProtonVPNTray:
         if is_autostart_enabled():
             try:
                 subprocess.run(
-                    [DISABLE_AUTOSTART_SH],
+                    [DISABLE_AUTOSTART_SH, "--quiet"],
                     capture_output=True, text=True, timeout=10,
-                    input="y\n",
                 )
             except Exception as e:
                 log.warning("disable autostart script failed: %s", e)
