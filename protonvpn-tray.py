@@ -718,6 +718,14 @@ class ProtonVPNTray:
                     % ("Connected" if self.connected else "Disconnected")
                 )
 
+            icon_name = "network-vpn" if self.connected else "network-offline"
+            if hasattr(self.indicator, "set_icon_full"):
+                self.indicator.set_icon_full(icon_name, "Proton VPN")
+            elif hasattr(self.indicator, "set_icon"):
+                self.indicator.set_icon(icon_name)
+            elif hasattr(self, "_status_icon") and self._status_icon is not None:
+                self._status_icon.set_from_icon_name(icon_name)
+
             if self.connected and not old_connected:
                 notify("Proton VPN", "Connected to VPN")
             elif not self.connected and old_connected and self.signed_in:
