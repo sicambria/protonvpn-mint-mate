@@ -677,12 +677,11 @@ check("dialog-fallback2: Unknown used", "Unknown" in full)
 heading("15. run_cli (mocked)")
 
 # 15.1 Success
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "output line\n"
-    mock_result.stderr = ""
-    mock_run.return_value = mock_result
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("output line\n", "")
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
 
     rc, out, err = MOD.run_cli(["status"])
     check("run_cli: success rc=0", rc == 0)
@@ -690,48 +689,49 @@ with patch.object(MOD.subprocess, "run") as mock_run:
     check("run_cli: success stderr", err == "")
 
 # 15.2 Error
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_result = MagicMock()
-    mock_result.returncode = 1
-    mock_result.stdout = ""
-    mock_result.stderr = "error msg"
-    mock_run.return_value = mock_result
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("", "error msg")
+    mock_proc.returncode = 1
+    mock_popen.return_value = mock_proc
 
     rc, out, err = MOD.run_cli(["bad-command"])
     check("run_cli: error rc=1", rc == 1)
     check("run_cli: error stderr", err == "error msg")
 
 # 15.3 Timeout
-with patch.object(MOD.subprocess, "run",
-                  side_effect=real_subprocess.TimeoutExpired("cmd", 5)):
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.side_effect = real_subprocess.TimeoutExpired("cmd", 5)
+    mock_popen.return_value = mock_proc
     rc, out, err = MOD.run_cli(["status"])
     check("run_cli: timeout rc=-1", rc == -1)
     check("run_cli: timeout msg", "Command timed out" in err)
+    check("run_cli: timeout kills process", mock_proc.kill.called)
 
 # 15.4 ProtonVPN binary not found
-with patch.object(MOD.subprocess, "run", side_effect=FileNotFoundError):
+with patch.object(MOD.subprocess, "Popen", side_effect=FileNotFoundError):
     rc, out, err = MOD.run_cli(["status"])
     check("run_cli: file-not-found rc=-2", rc == -2)
     check("run_cli: file-not-found msg",
           "protonvpn binary not found" in err)
 
 # 15.5 Generic exception
-with patch.object(MOD.subprocess, "run", side_effect=RuntimeError("boom")):
+with patch.object(MOD.subprocess, "Popen", side_effect=RuntimeError("boom")):
     rc, out, err = MOD.run_cli(["status"])
     check("run_cli: generic error rc=-3", rc == -3)
     check("run_cli: generic error msg", "boom" in err)
 
 # 15.6 Correct command prefix
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = ""
-    mock_result.stderr = ""
-    mock_run.return_value = mock_result
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("", "")
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
     MOD.run_cli(["status"])
     check("run_cli: uses PROTONVPN_BIN prefix",
-          mock_run.call_args[0][0][0] == MOD.PROTONVPN_BIN,
-          "got %s" % str(mock_run.call_args[0][0][0]))
+          mock_popen.call_args[0][0][0] == MOD.PROTONVPN_BIN,
+          "got %s" % str(mock_popen.call_args[0][0][0]))
 
 # ===================================================================
 # 16. run_cli_async — mocked
@@ -749,12 +749,11 @@ def cb(ret, out, err):
     callback_called.append((ret, out, err))
     lock.set()
 
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "async ok\n"
-    mock_result.stderr = ""
-    mock_run.return_value = mock_result
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("async ok\n", "")
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
     MOD.run_cli_async(["status"], 5, cb)
     lock.wait(timeout=3)
 
@@ -765,13 +764,12 @@ if callback_called:
     check("run_cli_async: stdout", callback_called[0][1] == "async ok")
 
 # 16.2 Thread is daemon
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD.threading, "Thread", wraps=MOD.threading.Thread) as mock_th:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = ""
-    mock_result.stderr = ""
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("", "")
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
     MOD.run_cli_async(["status"], 5, lambda r, o, e: None)
     import time; time.sleep(0.1)
     check("run_cli_async: daemon=True passed",
@@ -1258,12 +1256,11 @@ def my_cb(ret, out, err):
     cb_args.append((ret, out, err))
     lock.set()
 
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "test_output"
-    mock_result.stderr = ""
-    mock_run.return_value = mock_result
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.return_value = ("test_output", "")
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
 
     MOD.run_cli_async(["info"], 15, my_cb)
     lock.wait(timeout=3)
@@ -1288,8 +1285,10 @@ def cb2(ret, out, err):
     cb_args2.append((ret, out, err))
     lock2.set()
 
-with patch.object(MOD.subprocess, "run") as mock_run:
-    mock_run.side_effect = real_subprocess.TimeoutExpired("cmd", 5)
+with patch.object(MOD.subprocess, "Popen") as mock_popen:
+    mock_proc = MagicMock()
+    mock_proc.communicate.side_effect = real_subprocess.TimeoutExpired("cmd", 5)
+    mock_popen.return_value = mock_proc
     MOD.run_cli_async(["status"], 5, cb2)
     lock2.wait(timeout=3)
 
@@ -1314,133 +1313,122 @@ t.connection_info = "Server: CH#1"
 captured = t.connection_info
 check("I-showinfo: captures at click time", "CH#1" in captured)
 
-# 28.2 run_cli_async called with ["info"]
-with patch.object(MOD, "run_cli_async") as mock_async:
+# 28.2 run_cli_async called + dialog shown immediately with placeholder
+t._info_dialog_active = False
+with patch.object(MOD, "run_cli_async") as mock_async, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog:
     MOD.ProtonVPNTray._on_show_info(t, None)
     check("I-showinfo: run_cli_async called", mock_async.called)
     call_args = mock_async.call_args[0][0]
     check("I-showinfo: calls 'info' command", call_args == ["info"] or "info" in call_args)
     check("I-showinfo: uses CMD_TIMEOUT_INFO", mock_async.call_args[0][1] == MOD.CMD_TIMEOUT_INFO)
+    check("I-showinfo: dialog shown immediately", mock_dialog.called)
+    if mock_dialog.called:
+        placeholder = mock_dialog.call_args[0][1]
+        check("I-showinfo: placeholder has captured status", "CH#1" in placeholder)
+        check("I-showinfo: placeholder says please wait", "please wait" in placeholder.lower())
 
-# 28.3 Callback builds dialog parts correctly
-MOD.GLib.idle_add.reset_mock()
-# idle_add must invoke the function; _show_info_dialog is patched below
-MOD.GLib.idle_add.side_effect = lambda fn, *a: fn(*a)
+# 28.3 Callback builds dialog parts and updates existing dialog
+t._info_dialog_active = False
 t.connection_info = "Server: CH#1\nProtocol: WG"
 t.status_raw = "raw"
-cb_args = []
+update_args = []
 
-def fake_show_info_dialog(self, text):
-    cb_args.append(text)
+def fake_update_info_dialog(self, text):
+    update_args.append(text)
 
 with patch.object(MOD.subprocess, "run") as mock_run, \
-     patch.object(MOD, "run_cli_async") as mock_async:
+     patch.object(MOD, "run_cli_async") as mock_async, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="net details"), \
+     patch.object(MOD.GLib, "idle_add",
+                  side_effect=lambda fn, *a: fn(*a)) as mock_idle:
     mock_result = MagicMock()
     mock_result.returncode = 0
     mock_result.stdout = "1.2.3.4"
     mock_run.return_value = mock_result
 
-    with patch.object(MOD.ProtonVPNTray, "_show_info_dialog",
-                      fake_show_info_dialog):
+    with patch.object(MOD.ProtonVPNTray, "_update_info_dialog",
+                      fake_update_info_dialog):
         MOD.ProtonVPNTray._on_show_info(t, None)
         inner_cb = mock_async.call_args[0][2]
         inner_cb(0, "Account info text", "")
 
-check("I-showinfo: cb_args has data", len(cb_args) >= 1,
-      "len=%d" % len(cb_args))
-if cb_args:
+check("I-showinfo: update_args has data", len(update_args) >= 1,
+      "len=%d" % len(update_args))
+if update_args:
     check("I-showinfo: dialog contains VPN Connection header",
-          "\u2550\u2550\u2550 VPN Connection" in cb_args[0],
-          "text[:200]: %s" % cb_args[0][:200])
+          "\u2550\u2550\u2550 VPN Connection" in update_args[0],
+          "text[:200]: %s" % update_args[0][:200])
     check("I-showinfo: dialog contains Account section",
-          "Proton VPN Account" in cb_args[0])
+          "Proton VPN Account" in update_args[0])
     check("I-showinfo: dialog contains Diagnostics section",
-          "Network Diagnostics" in cb_args[0])
+          "Network Diagnostics" in update_args[0])
 
 # 28.4 CLI error → error shown in Account section
 t.connection_info = "Connected"
 with patch.object(MOD.subprocess, "run") as mock_run:
     mock_run.side_effect = FileNotFoundError
-    with patch.object(MOD, "run_cli_async") as mock_async:
+    with patch.object(MOD, "run_cli_async") as mock_async, \
+         patch.object(MOD, "_show_text_dialog",
+                      return_value=MagicMock()):
+        t._info_dialog_active = False
         MOD.ProtonVPNTray._on_show_info(t, None)
         cb = mock_async.call_args[0][2]
-        cb_args2 = []
-        with patch.object(MOD.GLib, "idle_add") as mock_idle:
-            mock_idle.side_effect = lambda fn, t: cb_args2.append(t)
-            cb(1, "", "CLI not found")
-    if cb_args2:
-        check("I-showinfo-error: CLI error shown",
-              "CLI error" in cb_args2[0] or "CLI not found" in cb_args2[0],
-              "got: %s" % cb_args2[0][:200])
+        update_args2 = []
+        with patch.object(MOD.ProtonVPNTray, "_update_info_dialog") as mock_update:
+            mock_update.side_effect = lambda t: update_args2.append(t)
+            with patch.object(MOD.GLib, "idle_add",
+                              side_effect=lambda fn, *a: fn(*a)):
+                cb(1, "", "CLI not found")
+        if update_args2:
+            check("I-showinfo-error: CLI error shown",
+                  "CLI error" in update_args2[0] or "CLI not found" in update_args2[0],
+                  "got: %s" % update_args2[0][:200])
 
 
 # ===================================================================
-# 29. INTEGRATION: _show_info_dialog (Popen + xdotool chain)
+# 29. INTEGRATION: _update_info_dialog
 # ===================================================================
-heading("29. INTEGRATION: _show_info_dialog Popen chain")
+heading("29. INTEGRATION: _update_info_dialog")
 
 t = make_tray()
 t._quitting = False
+t._info_dialog_active = True
+t._info_label = MagicMock()
 
 # 29.1 Quitting → returns early
 t._quitting = True
-with patch.object(MOD.subprocess, "Popen") as mock_popen:
-    MOD.ProtonVPNTray._show_info_dialog(t, "test text")
-    check("I-dialog: quitting skips Popen", not mock_popen.called)
+MOD.ProtonVPNTray._update_info_dialog(t, "any text")
+check("I-update-dialog: no crash when quitting", True)
 
-# 29.2 Normal flow: Popen called with correct args
+# 29.2 Not active → returns early, set_text NOT called
 t._quitting = False
-with patch.object(MOD.subprocess, "Popen") as mock_popen, \
-     patch.object(MOD, "_collect_network_details",
-                  return_value="net details"), \
-     patch.object(MOD.subprocess, "run") as mock_run:
-    mock_proc = MagicMock()
-    mock_popen.return_value = mock_proc
+t._info_dialog_active = False
+MOD.ProtonVPNTray._update_info_dialog(t, "any text")
+check("I-update-dialog: no crash when not active", True)
+check("I-update-dialog: set_text skipped when inactive",
+      not t._info_label.set_text.called)
 
-    MOD.ProtonVPNTray._show_info_dialog(t, "vpn text")
-
-    check("I-dialog: Popen called", mock_popen.called)
-    popen_args = mock_popen.call_args[0][0]
-    check("I-dialog: zenity is the command", "zenity" in popen_args)
-    check("I-dialog: --text-info flag", "--text-info" in popen_args)
-    check("I-dialog: --title set", "--title" in popen_args)
-    title_idx = popen_args.index("--title") if "--title" in popen_args else -1
-    if title_idx >= 0:
-        check("I-dialog: title is Proton VPN — Connection Info",
-              "Proton VPN — Connection Info" in popen_args[title_idx + 1],
-              "got %s" % popen_args[title_idx + 1])
-    check("I-dialog: --width set", "--width" in popen_args)
-    check("I-dialog: --height set", "--height" in popen_args)
-    check("I-dialog: --font=monospace", "--font=monospace" in popen_args)
-    check("I-dialog: stdin=PIPE", mock_popen.call_args[1].get("stdin") == real_subprocess.PIPE)
-    check("I-dialog: text=True", mock_popen.call_args[1].get("text") is True)
-
-    # 29.3 stdin written and closed
-    check("I-dialog: stdin.write called", mock_proc.stdin.write.called)
-    check("I-dialog: stdin.close called", mock_proc.stdin.close.called)
-
-    # 29.4 xdotool called
-    check("I-dialog: xdotool subprocess.run called", mock_run.called)
-    xd_args = mock_run.call_args[0][0] if mock_run.call_args else []
-    check("I-dialog: xdotool search --sync",
-          "xdotool" in xd_args and "--sync" in xd_args,
-          "args: %s" % xd_args)
-
-    # 29.5 proc.wait called with timeout
-    check("I-dialog: proc.wait called", mock_proc.wait.called)
-
-# 29.6 xdotool failure doesn't break dialog
+# 29.3 Normal flow: label.set_text called with correct content
 t._quitting = False
-with patch.object(MOD.subprocess, "Popen") as mock_popen, \
-     patch.object(MOD, "_collect_network_details",
-                  return_value="net"), \
-     patch.object(MOD.subprocess, "run",
-                  side_effect=FileNotFoundError) as mock_run:
-    mock_proc = MagicMock()
-    mock_popen.return_value = mock_proc
-    MOD.ProtonVPNTray._show_info_dialog(t, "vpn")
-    check("I-dialog-xd-fail: Popen still called", mock_popen.called)
-    check("I-dialog-xd-fail: proc.wait still called", mock_proc.wait.called)
+t._info_dialog_active = True
+MOD.ProtonVPNTray._update_info_dialog(t, "full info text")
+check("I-update-dialog: label.set_text called", t._info_label.set_text.called)
+if t._info_label.set_text.called:
+    check("I-update-dialog: correct content",
+          t._info_label.set_text.call_args[0][0] == "full info text")
+
+# 29.4 set_text exception → sets _info_dialog_active to False
+t._info_dialog_active = True
+t._info_label = MagicMock()
+t._info_label.set_text.side_effect = RuntimeError("widget destroyed")
+MOD.ProtonVPNTray._update_info_dialog(t, "text")
+check("I-update-dialog: exception clears active flag",
+      not t._info_dialog_active)
 
 
 # ===================================================================

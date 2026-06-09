@@ -18,7 +18,6 @@ import argparse
 import logging
 import time as _time
 import re as _re
-import webbrowser
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -56,20 +55,70 @@ CMD_TIMEOUT_INFO = 15
 CMD_TIMEOUT_CONFIG_SET = 8
 CONFIG_CACHE_TTL = 5
 
+_MAX_FAILURES = 10
+_failure_count = 0
+_polling_paused = False
+_polling_paused_notified = False
+_cli_lock = threading.Lock()
+
 
 def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
-    cmd = [PROTONVPN_BIN] + args
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return -1, "", "Command timed out"
-    except FileNotFoundError:
-        return -2, "", "protonvpn binary not found"
-    except Exception as e:
-        return -3, "", str(e)
+    global _failure_count, _polling_paused, _polling_paused_notified
+    with _cli_lock:
+        if _failure_count > 3:
+            delay = min(0.5 * (2 ** (_failure_count - 3)), 30)
+            _time.sleep(delay)
+        cmd = [PROTONVPN_BIN] + args
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            out, err = proc.communicate(timeout=timeout)
+            _failure_count = 0
+            _polling_paused = False
+            _polling_paused_notified = False
+            return proc.returncode, out.strip(), err.strip()
+        except subprocess.TimeoutExpired:
+            _failure_count += 1
+            if _failure_count >= _MAX_FAILURES and not _polling_paused:
+                _polling_paused = True
+            if proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            log.warning("protonvpn %s timed out after %ds (failure #%d)",
+                        " ".join(args), timeout, _failure_count)
+            return -1, "", "Command timed out"
+        except FileNotFoundError:
+            _failure_count += 1
+            if _failure_count >= _MAX_FAILURES and not _polling_paused:
+                _polling_paused = True
+            return -2, "", "protonvpn binary not found"
+        except Exception as e:
+            _failure_count += 1
+            if _failure_count >= _MAX_FAILURES and not _polling_paused:
+                _polling_paused = True
+            if proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            log.warning("protonvpn %s error: %s", " ".join(args), e)
+            return -3, "", str(e)
 
 
 def run_cli_async(args, timeout, callback):
@@ -237,8 +286,8 @@ def _show_text_dialog(title, text, width=700, height=500):
     scrolled = Gtk.ScrolledWindow()
     scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
     label = Gtk.Label(label=text, selectable=False, wrap=False, halign=Gtk.Align.START, valign=Gtk.Align.START)
-    label.set_margin_left(6)
-    label.set_margin_right(6)
+    label.set_margin_start(6)
+    label.set_margin_end(6)
     label.set_margin_top(6)
     label.set_margin_bottom(6)
     override_font = Gtk.CssProvider()
@@ -258,6 +307,7 @@ def _show_text_dialog(title, text, width=700, height=500):
     win.add(vbox)
     win.show_all()
     win.present()
+    return label
 
 
 def _raise_window(title):
@@ -294,6 +344,8 @@ class ProtonVPNTray:
         self._settings_parent = None
         self._polling = False
         self._quitting = False
+        self._info_dialog_active = False
+        self._info_label = None
         self._config_cache = {}
         self._config_cache_time = 0
 
@@ -708,6 +760,16 @@ class ProtonVPNTray:
             log.warning("zenity custom DNS failed: %s", e)
 
     def _poll_status(self):
+        global _polling_paused_notified
+        if _polling_paused:
+            if not _polling_paused_notified:
+                _polling_paused_notified = True
+                notify("Proton VPN",
+                       "CLI is not responding. Status polling paused. "
+                       "Will resume on next successful manual action.",
+                       "network-offline")
+                self.status_item.set_label("CLI unresponsive — polling paused")
+            return True
         if self.busy or self._polling:
             return True
         self._polling = True
@@ -987,9 +1049,29 @@ class ProtonVPNTray:
             log.warning("zenity favorites failed: %s", e)
 
     def _on_show_info(self, widget):
+        if self._info_dialog_active:
+            return
+
         connection_status = self.connection_info
 
+        self._info_label = _show_text_dialog(
+            "Proton VPN — Connection Info",
+            (
+                "═══ VPN Connection ═══\n"
+                + (connection_status or self.status_raw or "Unknown")
+                + "\n\n═══ Proton VPN Account ═══\n"
+                + "Collecting info — please wait...\n\n"
+                + "═══ Network Diagnostics ═══\n"
+                + "Collecting network details..."
+            ),
+            400, 200,
+        )
+        self._info_dialog_active = True
+
         def callback(ret, out, err):
+            if self._quitting and not self._info_dialog_active:
+                return
+
             parts = []
             vpn_lines = [connection_status or self.status_raw or "Unknown"]
             try:
@@ -1026,17 +1108,20 @@ class ProtonVPNTray:
             else:
                 parts.append("CLI error: " + (err or out or "Unknown error"))
             parts.append("═══ Network Diagnostics ═══")
-            parts.append("Collecting network details...")
-            GLib.idle_add(self._show_info_dialog, "\n\n".join(parts))
+            net_text = _collect_network_details()
+            parts.append(net_text)
+            full = "\n\n".join(parts)
+            GLib.idle_add(self._update_info_dialog, full)
+
         run_cli_async(["info"], CMD_TIMEOUT_INFO, callback)
 
-    def _show_info_dialog(self, vpn_text):
-        if self._quitting:
+    def _update_info_dialog(self, full_text):
+        if not self._info_dialog_active or self._quitting:
             return
-        net_text = _collect_network_details()
-        full = vpn_text + "\n\n" + net_text
-
-        _show_text_dialog("Proton VPN — Connection Info", full)
+        try:
+            self._info_label.set_text(full_text)
+        except Exception:
+            self._info_dialog_active = False
 
     def _on_toggle_autostart(self, widget):
         if is_autostart_enabled():
@@ -1072,7 +1157,24 @@ class ProtonVPNTray:
         notify("Proton VPN", "Refreshing...")
 
     def _on_about(self, widget):
-        webbrowser.open("https://github.com/sicambria/protonvpn-mint-mate")
+        dlg = Gtk.AboutDialog()
+        dlg.set_program_name("Proton VPN Tray")
+        dlg.set_title("About Proton VPN Tray")
+        dlg.set_comments(
+            "System tray application for managing Proton VPN "
+            "connections on Linux Mint MATE.\n"
+            "Provides one-click connect/disconnect, country selector, "
+            "Secure Core, Tor, P2P modes, Kill Switch, and more."
+        )
+        dlg.set_website("https://github.com/sicambria/protonvpn-mint-mate")
+        dlg.set_website_label("GitHub Repository")
+        dlg.set_copyright("Copyright (C) 2026  protonvpn-mint-mate contributors")
+        dlg.set_license_type(Gtk.License.GPL_3_0)
+        dlg.set_authors(["protonvpn-mint-mate contributors"])
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.set_modal(True)
+        dlg.run()
+        dlg.destroy()
 
     def _on_quit(self, widget):
         notify("Proton VPN", "Tray closed (VPN stays connected if active)")

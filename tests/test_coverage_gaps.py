@@ -779,7 +779,12 @@ t.connection_info = "Server: CH#1"
 t.status_raw = "Status: Connected"
 
 # 62.1 VPN IP extracted when tun interface present
-with patch.object(MOD.subprocess, "run") as mock_run:
+t._info_dialog_active = False
+with patch.object(MOD.subprocess, "run") as mock_run, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="") as mock_net:
     mock_curl_result = MagicMock()
     mock_curl_result.returncode = 0
     mock_curl_result.stdout = "1.2.3.4\n"
@@ -807,7 +812,11 @@ with patch.object(MOD.subprocess, "run") as mock_run:
 # 62.2 ip addr raises exception → no VPN IP shown
 t2 = make_tray(MOD)
 t2.connection_info = "Disconnected"
-with patch.object(MOD.subprocess, "run") as mock_run:
+with patch.object(MOD.subprocess, "run") as mock_run, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="") as mock_net:
     mock_curl_result = MagicMock()
     mock_curl_result.returncode = 0
     mock_curl_result.stdout = ""
@@ -815,6 +824,7 @@ with patch.object(MOD.subprocess, "run") as mock_run:
     mock_run.side_effect = [mock_curl_result, FileNotFoundError]
 
     with patch.object(MOD, "run_cli_async") as mock_async:
+        t2._info_dialog_active = False
         MOD.ProtonVPNTray._on_show_info(t2, None)
         cb = mock_async.call_args[0][2]
 
@@ -829,9 +839,14 @@ with patch.object(MOD.subprocess, "run") as mock_run:
 # 62.3 curl raises exception
 t3 = make_tray(MOD)
 t3.connection_info = "Not signed in"
-with patch.object(MOD.subprocess, "run") as mock_run:
+with patch.object(MOD.subprocess, "run") as mock_run, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="") as mock_net:
     mock_run.side_effect = FileNotFoundError("no curl")
     with patch.object(MOD, "run_cli_async") as mock_async:
+        t3._info_dialog_active = False
         MOD.ProtonVPNTray._on_show_info(t3, None)
         cb = mock_async.call_args[0][2]
         with patch.object(MOD.GLib, "idle_add") as mock_idle:
@@ -843,23 +858,32 @@ with patch.object(MOD.subprocess, "run") as mock_run:
                 check("62.3: curl exception → no crash", False, str(e))
 
 # ---------------------------------------------------------------------------
-# 63. _show_info_dialog — zenity exception path
+# 63. _update_info_dialog — exception path
 # ---------------------------------------------------------------------------
-heading("63. _show_info_dialog — exception")
+heading("63. _update_info_dialog — exception")
 
 t = make_tray(MOD)
 t._quitting = False
+t._info_dialog_active = True
+t._info_label = MagicMock()
 
-# 63.1 Popen raises → caught by except
-with patch.object(MOD.subprocess, "Popen",
-                  side_effect=OSError("no zenity")):
-    with patch.object(MOD, "_collect_network_details",
-                      return_value="net"):
-        try:
-            MOD.ProtonVPNTray._show_info_dialog(t, "vpn text")
-            check("63.1: Popen exception → no crash", True)
-        except Exception as e:
-            check("63.1: Popen exception → no crash", False, str(e))
+# 63.1 set_text raises → caught, flag cleared
+t._info_label.set_text.side_effect = RuntimeError("widget destroyed")
+try:
+    MOD.ProtonVPNTray._update_info_dialog(t, "vpn text")
+    check("63.1: set_text exception → no crash", True)
+    check("63.1: flag cleared after exception", not t._info_dialog_active)
+except Exception as e:
+    check("63.1: set_text exception → no crash", False, str(e))
+
+# 63.2 Quitting → returns early
+t._quitting = True
+t._info_dialog_active = True
+try:
+    MOD.ProtonVPNTray._update_info_dialog(t, "text")
+    check("63.2: quitting guard no crash", True)
+except Exception as e:
+    check("63.2: quitting guard no crash", False, str(e))
 
 # ---------------------------------------------------------------------------
 # 64. _on_toggle_autostart — script exception paths
@@ -1215,7 +1239,11 @@ heading("74. _on_show_info — ip addr edge branches")
 # 74.1 ip addr returns non-zero (VPN IP extraction skipped)
 t = make_tray(MOD)
 t.connection_info = "Server: CH#1"
-with patch.object(MOD.subprocess, "run") as mock_run:
+with patch.object(MOD.subprocess, "run") as mock_run, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="") as mock_net:
     mock_curl = MagicMock()
     mock_curl.returncode = 0
     mock_curl.stdout = "1.2.3.4\n"
@@ -1225,6 +1253,7 @@ with patch.object(MOD.subprocess, "run") as mock_run:
     mock_ip.stdout = ""
     mock_run.side_effect = [mock_curl, mock_ip]
     with patch.object(MOD, "run_cli_async") as mock_async:
+        t._info_dialog_active = False
         MOD.ProtonVPNTray._on_show_info(t, None)
         cb = mock_async.call_args[0][2]
         with patch.object(MOD.GLib, "idle_add") as mock_idle:
@@ -1238,7 +1267,11 @@ with patch.object(MOD.subprocess, "run") as mock_run:
 # 74.2 ip addr has inet lines but none match tun/proton (loopback only)
 t2 = make_tray(MOD)
 t2.connection_info = "Connected"
-with patch.object(MOD.subprocess, "run") as mock_run:
+with patch.object(MOD.subprocess, "run") as mock_run, \
+     patch.object(MOD, "_show_text_dialog",
+                  return_value=MagicMock()) as mock_dialog, \
+     patch.object(MOD, "_collect_network_details",
+                  return_value="") as mock_net:
     mock_curl2 = MagicMock()
     mock_curl2.returncode = 0
     mock_curl2.stdout = "8.8.8.8\n"
@@ -1248,6 +1281,7 @@ with patch.object(MOD.subprocess, "run") as mock_run:
                       "    inet 192.168.1.5/24 brd 192.168.1.255 scope global eth0\n"
     mock_run.side_effect = [mock_curl2, mock_ip2]
     with patch.object(MOD, "run_cli_async") as mock_async:
+        t2._info_dialog_active = False
         MOD.ProtonVPNTray._on_show_info(t2, None)
         cb = mock_async.call_args[0][2]
         with patch.object(MOD.GLib, "idle_add") as mock_idle:

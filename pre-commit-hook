@@ -63,6 +63,33 @@ fi
 # deduplicate, drop empty strings, keep only >3 chars
 fingerprints=($(printf '%s\n' "${fingerprints[@]}" | sort -u | awk 'length > 3'))
 
+_is_safe_ip() {
+	local ip="$1"
+	# RFC 1918 private /8
+	[[ "$ip" =~ ^10\. ]] && return 0
+	# RFC 1918 private /12 (172.16.0.0 – 172.31.255.255)
+	[[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+	# RFC 1918 private /16
+	[[ "$ip" =~ ^192\.168\. ]] && return 0
+	# RFC 5737 TEST-NET (203.0.113.x, 198.51.100.x)
+	[[ "$ip" =~ ^203\.0\.113\. ]] && return 0
+	[[ "$ip" =~ ^198\.51\.100\. ]] && return 0
+	# RFC 6598 carrier-grade NAT /10
+	[[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] && return 0
+	# Link-local (169.254.x.x)
+	[[ "$ip" =~ ^169\.254\. ]] && return 0
+	# Well-known DNS resolvers and loopback
+	case "$ip" in
+		127.0.0.1|0.0.0.0|255.255.255.255|\
+		1.1.1.1|1.0.0.1|\
+		8.8.8.8|8.8.4.4|\
+		208.67.222.222|208.67.220.220|\
+		9.9.9.9|149.112.112.112)
+			return 0 ;;
+	esac
+	return 1
+}
+
 # ── Scan helpers ─────────────────────────────────────────────────
 
 VIOLATIONS=0
@@ -127,24 +154,13 @@ _scan_content() {
 		# ─── IP address (non-whitelisted) ───
 		local ip_found
 		ip_found=$(echo "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -1) || true
-		if [ -n "$ip_found" ]; then
-			# whitelist well-known DNS / loopback / doc examples
-			case "$ip_found" in
-				127.0.0.1|0.0.0.0|255.255.255.255|\
-				1.1.1.1|1.0.0.1|\
-				8.8.8.8|8.8.4.4|\
-				208.67.222.222|208.67.220.220|\
-				9.9.9.9|149.112.112.112|\
-				192.168.0.1|192.168.1.1|10.0.0.1|10.10.10.10) ;;
-				*)
-					local already=0
-					for fp in "${fingerprints[@]}"; do
-						[ "$fp" = "$ip_found" ] && already=1 && break
-					done
-					[ $already -eq 0 ] && _print_violation "$file" "$lnum" \
-						"unexpected IP address" "$ip_found"
-					;;
-			esac
+		if [ -n "$ip_found" ] && ! _is_safe_ip "$ip_found"; then
+			local already=0
+			for fp in "${fingerprints[@]}"; do
+				[ "$fp" = "$ip_found" ] && already=1 && break
+			done
+			[ $already -eq 0 ] && _print_violation "$file" "$lnum" \
+				"unexpected IP address" "$ip_found"
 		fi
 
 		# ─── UUID pattern ───

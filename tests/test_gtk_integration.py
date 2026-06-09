@@ -2,17 +2,24 @@
 """GTK integration tests for protonvpn-tray.
 
 Tests real GTK/Ayatana/StatusIcon indicator creation with actual GI bindings.
-Requires a display (Xvfb, X11, or Wayland). Skips gracefully if unavailable.
+This test spawns REAL GTK windows. Never run it on your live desktop.
 
-Run with: DISPLAY=:99 python3 tests/test_gtk_integration.py
-Or:       xvfb-run python3 tests/test_gtk_integration.py
+SAFE usage (headless only):
+    PROTONVPN_TEST_LIVE=1 xvfb-run python3 tests/test_gtk_integration.py
+
+Without PROTONVPN_TEST_LIVE=1, this file exits immediately — no GTK import.
 """
 
 import os
 import sys
+
+if not os.environ.get("PROTONVPN_TEST_LIVE"):
+    print("SKIP: Set PROTONVPN_TEST_LIVE=1 to run GTK integration tests", file=sys.stderr)
+    print("      Always use xvfb-run: PROTONVPN_TEST_LIVE=1 xvfb-run python3 tests/test_gtk_integration.py", file=sys.stderr)
+    sys.exit(0)
+
 import gi
 
-# Check for display early
 try:
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, GLib
