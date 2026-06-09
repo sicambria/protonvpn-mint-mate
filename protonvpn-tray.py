@@ -100,7 +100,11 @@ def is_autostart_enabled():
 
 
 def parse_status(output):
-    if "not signed in" in output.lower() or "not authenticated" in output.lower():
+    out_lower = output.lower()
+    if any(kw in out_lower for kw in [
+        "not signed in", "not authenticated", "please sign in",
+        "authenticate first", "need to authenticate", "sign in first"
+    ]):
         return "not_signed_in", output
     lines = output.split("\n")
     first_line = lines[0].strip() if lines else ""
@@ -116,7 +120,7 @@ def parse_status(output):
                     info_parts.append(stripped)
             return "connected", "\n".join(info_parts) if info_parts else "Connected"
         return "unknown", output
-    if "Status:" not in output and "status" not in output.lower():
+    if "Status:" not in output and "status" not in output.lower() and output.strip() == "":
         return "not_signed_in", output
     return "unknown", output
 
@@ -543,8 +547,8 @@ class ProtonVPNTray:
                 [
                     "zenity", "--entry",
                     "--title", "Custom DNS",
-                    "--text", "Enter DNS server IPs (comma or space-separated):\n\nLeave empty to disable custom DNS.",
-                    "--width", "450",
+                    "--text", "Enter DNS server IPs (comma-separated):\n\nLeave empty to disable custom DNS.\n\nExample: 1.1.1.1,8.8.8.8",
+                    "--width", "480",
                 ],
                 capture_output=True, text=True, timeout=60,
             )
@@ -559,16 +563,17 @@ class ProtonVPNTray:
                     on_done=lambda ret, out, err: notify("Custom DNS", "Disabled"),
                 )
             else:
-                dns_ips = dns_input.replace(",", " ").split()
-                if not dns_ips:
+                # Normalize: strip spaces, join with commas
+                ips = [ip.strip() for ip in dns_input.replace(",", " ").split() if ip.strip()]
+                if not ips:
                     return
-                args = ["config", "set", "custom-dns", "on", "--dns"] + dns_ips
+                dns_arg = ",".join(ips)
                 self._run_vpn_action(
-                    args,
+                    ["config", "set", "custom-dns", "on", "--dns", dns_arg],
                     CMD_TIMEOUT_CONFIG_SET,
-                    "Setting custom DNS",
+                    "Setting custom DNS to " + dns_arg,
                     on_done=lambda ret, out, err: notify(
-                        "Custom DNS", "Set to: %s" % ", ".join(dns_ips)
+                        "Custom DNS", "Set to: " + dns_arg if ret == 0 else "Failed: " + (err or "unknown error")
                     ),
                 )
         except Exception as e:
