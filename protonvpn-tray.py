@@ -229,16 +229,19 @@ def _collect_network_details():
     return "\n\n".join(details)
 
 
-def _spawn_xdotool_raise(title):
-    def _do():
+def _raise_window(title):
+    for cmd in [
+        ["wmctrl", "-a", title],
+        ["xdotool", "search", "--sync", "--name", title, "windowactivate"],
+    ]:
         try:
-            subprocess.run(
-                ["xdotool", "search", "--sync", "--name", title, "windowactivate"],
-                capture_output=True, timeout=10,
-            )
-        except Exception:
-            pass
-    threading.Thread(target=_do, daemon=True).start()
+            subprocess.run(cmd, capture_output=True, timeout=10)
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            log.warning("window raise failed (%s): %s", cmd[0], e)
+            continue
 
 
 class ProtonVPNTray:
@@ -620,21 +623,23 @@ class ProtonVPNTray:
 
     def _on_custom_dns(self, widget):
         try:
-            _spawn_xdotool_raise("Custom DNS")
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "zenity", "--entry",
                     "--title", "Custom DNS",
+                    "--modal",
                     "--text",
                     "Enter DNS server IPs (comma-separated):\n\n"
                     "Leave empty to disable custom DNS.\n\n"
                     "Example: 1.1.1.1,8.8.8.8",
                     "--width", "480",
                 ],
-                capture_output=True, text=True, timeout=60,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            dns_input = result.stdout.strip()
-            if result.returncode != 0:
+            _raise_window("Custom DNS")
+            stdout, _ = proc.communicate(timeout=60)
+            dns_input = stdout.strip()
+            if proc.returncode != 0:
                 return
             if not dns_input:
                 self._run_vpn_action(
@@ -886,12 +891,14 @@ class ProtonVPNTray:
                 args.append(cname)
 
         try:
-            _spawn_xdotool_raise("Default Country")
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=60
+            args.insert(1, "--modal")
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            selected = result.stdout.strip()
-            if result.returncode == 0 and selected:
+            _raise_window("Default Country")
+            stdout, _ = proc.communicate(timeout=60)
+            selected = stdout.strip()
+            if proc.returncode == 0 and selected:
                 self.config["default_country"] = selected
                 self._save_config()
                 notify("Default Country", "Set to " + selected)
@@ -922,23 +929,25 @@ class ProtonVPNTray:
             args.append(cname)
 
         try:
-            _spawn_xdotool_raise("Manage Favorites")
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=60
+            args.insert(1, "--modal")
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            if result.returncode == 0:
+            _raise_window("Manage Favorites")
+            stdout, _ = proc.communicate(timeout=60)
+            if proc.returncode == 0:
                 selected = [
                     s.strip()
-                    for s in result.stdout.strip().split(",")
+                    for s in stdout.strip().split(",")
                     if s.strip()
                 ]
                 self.config["favorites"] = selected
                 self._save_config()
                 notify("Favorites", "Updated (%d favorites)" % len(selected))
-            elif result.returncode == 1:
+            elif proc.returncode == 1:
                 pass
             else:
-                log.warning("zenity favorites returned %d", result.returncode)
+                log.warning("zenity favorites returned %d", proc.returncode)
         except Exception as e:
             log.warning("zenity favorites failed: %s", e)
 
@@ -999,19 +1008,14 @@ class ProtonVPNTray:
                     "--title", "Proton VPN — Connection Info",
                     "--width", "700", "--height", "500",
                     "--font=monospace",
+                    "--ok-label=Close",
+                    "--cancel-label=",
                 ],
                 stdin=subprocess.PIPE, text=True,
             )
             proc.stdin.write(full)
             proc.stdin.close()
-            try:
-                subprocess.run(
-                    ["xdotool", "search", "--sync", "--name",
-                     "Proton VPN — Connection Info", "windowactivate"],
-                    timeout=10,
-                )
-            except Exception:
-                pass
+            _raise_window("Proton VPN — Connection Info")
             proc.wait(timeout=60)
         except Exception as e:
             log.warning("zenity info failed: %s", e)
@@ -1075,5 +1079,5 @@ def main():
     app.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
