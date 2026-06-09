@@ -1,0 +1,13 @@
+[run]
+source = protonvpn-tray.py
+branch = True
+omit = */tests/*,*/.opencode/*,*/htmlcov/*
+
+[report]
+show_missing = True
+precision = 2
+exclude_lines =
+    pragma: no cover
+
+[html]
+directory = htmlcov

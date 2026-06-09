@@ -5,3 +5,9 @@ __pycache__/
 
 # Config (user-specific, tracked via template)
 ~/.config/protonvpn-tray/
+
+# Coverage
+.coverage
+*,cover
+coverage.json
+htmlcov/

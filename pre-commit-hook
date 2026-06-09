@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# pre-commit hook — secrets & host fingerprint scanner
+# Part of protonvpn-mint-mate
+#
+# Dynamically collects machine identifiers at runtime (username, hostname,
+# MACs, IPs, machine ID) then scans staged files for any of those values
+# plus common secret patterns (API keys, private keys, credentials).
+#
+# Skip:   git commit --no-verify
+#         SKIP_SECRET_SCAN=1 git commit -m "..."
+
+set -euo pipefail
+
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── Runtime system fingerprint ──────────────────────────────────
+
+fingerprints=()
+
+# username / home directory
+fingerprints+=("$USER")
+fingerprints+=("$HOME")
+
+# hostname (nodename, short, FQDN — each added only when distinct)
+_hn=""
+_hn=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)
+[ -n "$_hn" ] && fingerprints+=("$_hn")
+_hns=$(hostname -s 2>/dev/null || true)
+[ -n "$_hns" ] && [ "$_hns" != "$_hn" ] && fingerprints+=("$_hns")
+_hnf=$(hostname -f 2>/dev/null || true)
+[ -n "$_hnf" ] && [ "$_hnf" != "$_hn" ] && [ "$_hnf" != "$_hns" ] && fingerprints+=("$_hnf")
+
+# machine-id (systemd) and dbus machine-id
+for _mf in /etc/machine-id /var/lib/dbus/machine-id; do
+	[ -f "$_mf" ] && fingerprints+=("$(tr -d '[:space:]' < "$_mf")")
+done
+
+# MAC addresses — every interface except loopback (00:00:00:00:00:00)
+if command -v ip &>/dev/null; then
+	while IFS= read -r _mac; do
+		[ -z "$_mac" ] && continue
+		[ "$_mac" = "00:00:00:00:00:00" ] && continue
+		fingerprints+=("$_mac")
+	done < <(ip -o link show 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || true)
+elif [ -d /sys/class/net ]; then
+	for _ni in /sys/class/net/*/address; do
+		[ -f "$_ni" ] || continue
+		_mac=$(tr -d '[:space:]' < "$_ni")
+		[ "$_mac" = "00:00:00:00:00:00" ] && continue
+		fingerprints+=("$_mac")
+	done
+fi
+
+# local IPv4 / IPv6 addresses
+if command -v hostname &>/dev/null; then
+	for _ip in $(hostname -I 2>/dev/null || true); do
+		[ -n "$_ip" ] && fingerprints+=("$_ip")
+	done
+fi
+
+# deduplicate, drop empty strings, keep only >3 chars
+fingerprints=($(printf '%s\n' "${fingerprints[@]}" | sort -u | awk 'length > 3'))
+
+# ── Scan helpers ─────────────────────────────────────────────────
+
+VIOLATIONS=0
+
+_print_violation() {
+	local file="$1" line="$2" kind="$3" detail="$4"
+	printf "  ${RED}${BOLD}[!]${NC} %s:%-4s  %s\n" "$file" "$line" "$kind"
+	[ -n "$detail" ] && printf "      %s\n" "$detail"
+	VIOLATIONS=$((VIOLATIONS + 1))
+}
+
+_scan_content() {
+	local file="$1" content="$2"
+	local lnum=0
+
+	while IFS= read -r line; do
+		lnum=$((lnum + 1))
+		[ -z "$line" ] && continue
+
+		# ─── runtime fingerprints (fixed-string match) ───
+		for fp in "${fingerprints[@]}"; do
+			[ -z "$fp" ] && continue
+			# use grep -F on the single line for this fingerprint
+			if [[ "$line" == *"$fp"* ]]; then
+				_print_violation "$file" "$lnum" \
+					"host identifier leaked" \
+					"$(printf '%.70s' "$line")"
+				break  # one violation per line is enough
+			fi
+		done
+
+		# ─── private key header ───
+		if echo "$line" | grep -qE -- '\-{5}(BEGIN|END) .*PRIVATE KEY\-{5}'; then
+			_print_violation "$file" "$lnum" "private key" ""
+		fi
+
+		# ─── known API key / token prefixes ───
+		if echo "$line" | grep -qE '\b(AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{36,}|(sk|pk|TESTKEY)_(live|test)_[A-Za-z0-9]{24,}|xox[bpras]-[A-Za-z0-9-]+|github_pat_[A-Za-z0-9_]{36,}|AIza[0-9A-Za-z\-_]{35})\b'; then
+			_print_violation "$file" "$lnum" "API key / token" "$(printf '%.70s' "$line")"
+		fi
+
+		# ─── credential = value assignments ───
+		if echo "$line" | grep -qiE '(api[_-]?key|apikey|secret[_-]?key|client_secret|auth[_-]?token|access[_-]?token|db[_-]?password|database[_-]?url|connection[_-]?string)\s*[:=]\s*['\''"]?\S+['\''"]?'; then
+			# skip comments / docs that literally say "your-password"
+			echo "$line" | grep -qiE 'your[-_](password|token|key|secret)|changeme|xxxxxxxx' && continue
+			_print_violation "$file" "$lnum" "credential assignment" "$(printf '%.70s' "$line")"
+		fi
+
+		# ─── MAC address pattern (generic, not just own) ───
+		local mac_found
+		mac_found=$(echo "$line" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1) || true
+		if [ -n "$mac_found" ] && [ "$mac_found" != "00:00:00:00:00:00" ]; then
+			# skip if already caught by fingerprint pass above (avoids double-report)
+			local already=0
+			for fp in "${fingerprints[@]}"; do
+				[ "$fp" = "$mac_found" ] && already=1 && break
+			done
+			[ $already -eq 0 ] && _print_violation "$file" "$lnum" \
+				"MAC address" "$mac_found"
+		fi
+
+		# ─── IP address (non-whitelisted) ───
+		local ip_found
+		ip_found=$(echo "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -1) || true
+		if [ -n "$ip_found" ]; then
+			# whitelist well-known DNS / loopback / doc examples
+			case "$ip_found" in
+				127.0.0.1|0.0.0.0|255.255.255.255|\
+				1.1.1.1|1.0.0.1|\
+				8.8.8.8|8.8.4.4|\
+				208.67.222.222|208.67.220.220|\
+				9.9.9.9|149.112.112.112|\
+				192.168.0.1|192.168.1.1|10.0.0.1|10.10.10.10) ;;
+				*)
+					local already=0
+					for fp in "${fingerprints[@]}"; do
+						[ "$fp" = "$ip_found" ] && already=1 && break
+					done
+					[ $already -eq 0 ] && _print_violation "$file" "$lnum" \
+						"unexpected IP address" "$ip_found"
+					;;
+			esac
+		fi
+
+		# ─── UUID pattern ───
+		local uuid_found
+		uuid_found=$(echo "$line" | grep -oE '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b' | head -1) || true
+		if [ -n "$uuid_found" ]; then
+			local already=0
+			for fp in "${fingerprints[@]}"; do
+				[ "$fp" = "$uuid_found" ] && already=1 && break
+			done
+			[ $already -eq 0 ] && _print_violation "$file" "$lnum" \
+				"UUID" "$uuid_found"
+		fi
+
+	done <<< "$content"
+}
+
+# ── File classification ─────────────────────────────────────────
+
+_should_scan() {
+	case "$1" in
+		tests/*|docs/*|LICENSE|images/*|*.png|*.jpg|*.svg|*.ico|*.gif)
+			return 1 ;;
+		*.py|*.sh|*.bash|*.desktop|*.json|*.yml|*.yaml|*.toml|*.cfg|*.conf|*.ini|*.env|*.service|*.timer|*.pem|*.key|*.crt)
+			return 0 ;;
+		Makefile|Dockerfile|*.mk)
+			return 0 ;;
+		*)
+			# if no known extension but is a text file, scan it
+			if file "$1" 2>/dev/null | grep -q 'text'; then
+				return 0
+			fi
+			return 1 ;;
+	esac
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+
+# Allow skip via environment variable
+if [ "${SKIP_SECRET_SCAN:-}" = "1" ]; then
+	exit 0
+fi
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+
+if [ -z "$STAGED" ]; then
+	exit 0
+fi
+
+echo ""
+
+for _file in $STAGED; do
+	_should_scan "$_file" || continue
+	_content=$(git show ":$_file" 2>/dev/null) || continue
+	_scan_content "$_file" "$_content"
+done
+
+echo ""
+
+if [ $VIOLATIONS -gt 0 ]; then
+	printf "  ${RED}${BOLD}✖  BLOCKED — %d host/secrets leak(s) detected.${NC}\n" "$VIOLATIONS"
+	printf "  %-4s git commit --no-verify  (bypass in emergencies only)\n" ""
+	echo ""
+	exit 1
+fi
+
+echo "  ✓  secrets scan: OK"
+echo ""
+exit 0
