@@ -18,6 +18,7 @@ import argparse
 import logging
 import time as _time
 import re as _re
+import webbrowser
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -438,6 +439,9 @@ class ProtonVPNTray:
         menu.append(self.autostart_item)
 
         menu.append(self._mk_item("Refresh", self._on_refresh))
+        menu.append(self._mk_sep())
+
+        menu.append(self._mk_item("About", self._on_about))
         menu.append(self._mk_sep())
 
         menu.append(self._mk_item("Quit", self._on_quit))
@@ -1036,6 +1040,9 @@ class ProtonVPNTray:
         GLib.idle_add(self._poll_status)
         GLib.timeout_add(500, self._load_countries_async)
         notify("Proton VPN", "Refreshing...")
+
+    def _on_about(self, widget):
+        webbrowser.open("https://github.com/sicambria/protonvpn-mint-mate")
 
     def _on_quit(self, widget):
         notify("Proton VPN", "Tray closed (VPN stays connected if active)")
