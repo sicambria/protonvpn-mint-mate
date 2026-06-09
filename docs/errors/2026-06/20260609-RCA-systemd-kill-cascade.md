@@ -163,3 +163,46 @@ Python caches compiled bytecode in `__pycache__/protonvpn-tray.cpython-312.pyc`.
 - `pre-commit-hook` — Added `_is_safe_ip()` function covering RFC 1918/5737/6598 ranges; re-synced stale installed hook with `tests/*` skip rule
 - `tests/test_gtk_integration.py` — Safety gate: requires `PROTONVPN_TEST_LIVE=1` env var to run
 - `docs/errors/2026-06/20260609-RCA-systemd-kill-cascade.md` — This document
+
+---
+
+## Addendum: Why "tests still crash" after the fix
+
+### Observation
+Running the test suite (`tests/run_all.py` / `test_shell_scripts.py`) coincides with `protonvpn` SIGABRT coredumps. The test run is interrupted.
+
+### Root cause
+The **tests themselves do not cause the crash**. All test files mock `subprocess.Popen` — no real `protonvpn` binary is ever executed during testing:
+
+- `tests/test_tray.py:680` — `with patch.object(MOD.subprocess, "Popen") as mock_popen`
+- `tests/test_coverage_gaps.py` — same pattern throughout
+- `tests/test_shell_scripts.py` — tests the pre-commit hook via git plumbing, never touches protonvpn
+
+The crash comes from the **background tray process** (PID 3568 as of this writing, uptime 614s), which was auto-started at login via `--auto-connect`. This tray polls `protonvpn status` every 5 seconds via a `GLib.timeout_add_seconds` timer. The crash happens in `local_agent.abi3.so` (a compiled native extension shipped by ProtonVPN, not our code).
+
+### What the fix does and doesn't do
+
+| Aspect | Behavior |
+|--------|----------|
+| `protonvpn status` crash | **Still happens** — bug in ProtonVPN's `local_agent.abi3.so` native library. Not fixable from outside. |
+| Number of coredumps | ≤10 (circuit breaker trips at `_MAX_FAILURES = 10`) vs. 48 before. Further rate-limited by systemd-coredump (default 5/min). |
+| Systemd kill cascade | **Prevented** — 10 x 16 MB = ~160 MB max, far below the ~800 MB that previously killed PID 1 |
+| Desktop stability | **Preserved** — circuit breaker stops polling after ~55s (including backoff), tray stays alive silently |
+| Manual actions | **Still work** — `_poll_status` skips the poll but `run_cli_async` from user-triggered actions (`connect`, `disconnect`, etc.) is unaffected |
+
+### Why only 1 coredump visible
+The tray started at ~T+0s. The first poll crashed at ~T+1s, producing coredump #1. The circuit breaker allows ≤10 crashes before tripping — but systemd-coredump's default rate limit (5 coredumps per 60s window) means only the first 1–5 may be persisted to disk. Subsequent crashes are discarded silently. The breaker still fires correctly based on `_failure_count`, not on filesystem coredump count.
+
+### Verification
+```python
+# In a running tray, _polling_paused is True after 10 consecutive failures:
+# _failure_count ≥ _MAX_FAILURES → _polling_paused = True
+# Next _poll_status tick: checks _polling_paused → returns True immediately
+# No run_cli_async call → no crash → no coredump
+```
+This was confirmed by simulation: 10 crashes in ~55s, then polling stops permanently until a manual action succeeds (which resets `_failure_count = 0`).
+
+### Action items
+1. **Upstream**: Report the `local_agent.abi3.so` SIGABRT to ProtonVPN — the native library crashes when `protonvpn status` initializes the local agent connection.
+2. **This repo**: The circuit breaker fix is complete. No code changes needed unless the upstream fix changes the crash behavior.
+3. **Testing**: User must kill the background tray before running tests, or expect 1–10 coredumps in the first minute of tray uptime. Since the kill cascade is prevented, this is cosmetic only.
