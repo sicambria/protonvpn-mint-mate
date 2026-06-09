@@ -1,0 +1,7 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Config (user-specific, tracked via template)
+~/.config/protonvpn-tray/
