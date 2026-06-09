@@ -16,6 +16,8 @@ import subprocess
 import threading
 import argparse
 import logging
+import time as _time
+import re as _re
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -49,8 +51,9 @@ CMD_TIMEOUT_CONNECT = 25
 CMD_TIMEOUT_DISCONNECT = 10
 CMD_TIMEOUT_COUNTRIES = 45
 CMD_TIMEOUT_CONFIG = 8
-CMD_TIMEOUT_INFO = 8
+CMD_TIMEOUT_INFO = 15
 CMD_TIMEOUT_CONFIG_SET = 8
+CONFIG_CACHE_TTL = 5
 
 
 def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
@@ -182,6 +185,60 @@ def notify(title, body, icon="network-vpn"):
         log.warning("Notification failed: %s", e)
 
 
+def _collect_network_details():
+    """Gather real IP, VPN IP, and network adapter info for diagnostics."""
+    details = []
+
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            details.append("--- Network Interfaces ---")
+            details.append(result.stdout.strip())
+    except Exception:
+        details.append("--- Network Interfaces ---")
+        details.append("(ip command not available)")
+
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            details.append("--- Default Route ---")
+            details.append(result.stdout.strip() or "(none)")
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "5", "https://api.ipify.org"],
+            capture_output=True, text=True, timeout=8,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            details.append("--- Real Public IP ---")
+            details.append(result.stdout.strip())
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "5", "https://vpn-api.proton.me/vpn/logicals"],
+            capture_output=True, text=True, timeout=8,
+        )
+        if result.returncode == 0:
+            details.append("--- VPN Server Info (via Proton API) ---")
+            details.append("API reachable: yes")
+        else:
+            details.append("--- VPN Server Info (via Proton API) ---")
+            details.append("API unreachable (VPN may not be active)")
+    except Exception:
+        details.append("--- VPN Server Info ---")
+        details.append("(curl not available)")
+
+    return "\n\n".join(details)
+
+
 class ProtonVPNTray:
     def __init__(self, auto_connect=False):
         self.auto_connect = auto_connect
@@ -196,10 +253,13 @@ class ProtonVPNTray:
         self.indicator = None
         self.menu = None
         self.status_item = None
-        self.country_submenu = None
         self.autostart_item = None
+        self._country_parent = None
+        self._settings_parent = None
         self._polling = False
         self._quitting = False
+        self._config_cache = {}
+        self._config_cache_time = 0
 
         self._check_pid()
         self._write_pid()
@@ -221,8 +281,6 @@ class ProtonVPNTray:
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
 
-    # ── Config management ──────────────────────────────────────────────
-
     def _load_config(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         if os.path.exists(CONFIG_FILE):
@@ -239,8 +297,6 @@ class ProtonVPNTray:
     def _save_config(self):
         atomic_write_json(CONFIG_FILE, self.config)
 
-    # ── PID management ─────────────────────────────────────────────────
-
     def _check_pid(self):
         if not os.path.exists(PID_FILE):
             return
@@ -248,7 +304,7 @@ class ProtonVPNTray:
             with open(PID_FILE, "r") as f:
                 pid = int(f.read().strip())
             os.kill(pid, 0)
-            print(f"protonvpn-tray is already running (PID {pid}).", file=sys.stderr)
+            print("protonvpn-tray is already running (PID %d)." % pid, file=sys.stderr)
             print("Only one instance is allowed.", file=sys.stderr)
             sys.exit(2)
         except (ValueError, ProcessLookupError, OSError):
@@ -260,7 +316,10 @@ class ProtonVPNTray:
             with os.fdopen(fd, "w") as f:
                 f.write(str(os.getpid()))
         except FileExistsError:
-            print("protonvpn-tray: PID file already exists (another instance may be starting).", file=sys.stderr)
+            print(
+                "protonvpn-tray: PID file already exists (another instance may be starting).",
+                file=sys.stderr,
+            )
             sys.exit(2)
 
     def _remove_pid(self):
@@ -281,13 +340,9 @@ class ProtonVPNTray:
             pass
         Gtk.main_quit()
 
-    # ── Signal handlers ────────────────────────────────────────────────
-
     def _on_signal(self, signum, frame):
         log.info("Received signal %s, shutting down", signum)
         self._shutdown()
-
-    # ── Indicator creation ─────────────────────────────────────────────
 
     def _create_indicator(self):
         self.indicator = self._try_ayatana()
@@ -324,16 +379,12 @@ class ProtonVPNTray:
 
     def _on_status_icon_popup(self, icon, button, activate_time):
         if self.menu:
-            self.menu.popup(None, None, icon.position_menu, icon, button, activate_time)
+            self.menu.popup(
+                None, None, icon.position_menu, icon, button, activate_time
+            )
 
     def _on_status_icon_activate(self, icon):
         pass
-
-    def set_menu(self, menu):
-        if hasattr(self.indicator, "set_menu"):
-            self.indicator.set_menu(menu)
-
-    # ── Menu building ──────────────────────────────────────────────────
 
     def _mk_item(self, label, callback):
         item = Gtk.MenuItem(label=label)
@@ -346,6 +397,7 @@ class ProtonVPNTray:
 
     def _build_menu(self):
         menu = Gtk.Menu()
+        menu.connect("show", self._on_menu_show)
 
         self.status_item = Gtk.MenuItem(label="Proton VPN")
         self.status_item.set_sensitive(False)
@@ -354,11 +406,9 @@ class ProtonVPNTray:
 
         menu.append(self._mk_item("Connect (Fastest)", self._on_connect_fastest))
 
-        country_parent = Gtk.MenuItem(label="Connect to Country")
-        self.country_submenu = Gtk.Menu()
-        self.country_submenu.connect("map", self._on_country_submenu_show)
-        country_parent.set_submenu(self.country_submenu)
-        menu.append(country_parent)
+        self._country_parent = Gtk.MenuItem(label="Connect to Country")
+        self._country_parent.connect("activate", self._on_country_activate)
+        menu.append(self._country_parent)
 
         menu.append(self._mk_item("Secure Core", self._on_connect_securecore))
         menu.append(self._mk_item("Tor", self._on_connect_tor))
@@ -372,11 +422,9 @@ class ProtonVPNTray:
         menu.append(self._mk_item("Manage Favorites...", self._on_manage_favorites))
         menu.append(self._mk_sep())
 
-        settings_parent = Gtk.MenuItem(label="Settings")
-        self.settings_submenu = Gtk.Menu()
-        self.settings_submenu.connect("map", self._on_settings_submenu_show)
-        settings_parent.set_submenu(self.settings_submenu)
-        menu.append(settings_parent)
+        self._settings_parent = Gtk.MenuItem(label="Settings")
+        self._settings_parent.connect("activate", self._on_settings_activate)
+        menu.append(self._settings_parent)
         menu.append(self._mk_sep())
 
         menu.append(self._mk_item("Connection Info", self._on_show_info))
@@ -396,20 +444,37 @@ class ProtonVPNTray:
         menu.show_all()
         return menu
 
-    # ── Country submenu ────────────────────────────────────────────────
+    def _on_menu_show(self, widget):
+        self._rebuild_all_submenus()
 
-    def _on_country_submenu_show(self, widget):
-        self._rebuild_country_submenu()
+    def _on_country_activate(self, widget):
+        pass
 
-    def _rebuild_country_submenu(self):
-        for child in self.country_submenu.get_children():
-            self.country_submenu.remove(child)
+    def _on_settings_activate(self, widget):
+        pass
+
+    def _rebuild_all_submenus(self):
+        if self._country_parent:
+            old_country = self._country_parent.get_submenu()
+            if old_country:
+                old_country.destroy()
+            self._country_parent.set_submenu(self._build_country_menu())
+            self._country_parent.show_all()
+
+        if self._settings_parent:
+            old_settings = self._settings_parent.get_submenu()
+            if old_settings:
+                old_settings.destroy()
+            self._settings_parent.set_submenu(self._build_settings_menu())
+            self._settings_parent.show_all()
+
+    def _build_country_menu(self):
+        sub = Gtk.Menu()
 
         favorites = self.config.get("favorites", [])
         all_countries = list(self.countries_cache) if self.countries_loaded else []
 
         done_codes = set()
-
         fav_entries = []
         for code in favorites:
             for ccode, cname in all_countries:
@@ -423,10 +488,10 @@ class ProtonVPNTray:
         for code, name in fav_entries:
             item = Gtk.MenuItem(label="★ " + name + " (" + code + ")")
             item.connect("activate", self._make_country_connect_handler(code))
-            self.country_submenu.append(item)
+            sub.append(item)
 
         if fav_entries:
-            self.country_submenu.append(self._mk_sep())
+            sub.append(self._mk_sep())
 
         if self.countries_loaded and all_countries:
             other = [(c, n) for c, n in all_countries if c not in done_codes]
@@ -434,86 +499,80 @@ class ProtonVPNTray:
             for code, name in other:
                 item = Gtk.MenuItem(label=name + " (" + code + ")")
                 item.connect("activate", self._make_country_connect_handler(code))
-                self.country_submenu.append(item)
+                sub.append(item)
         elif not self.countries_loaded:
             item = Gtk.MenuItem(label="Loading countries...")
             item.set_sensitive(False)
-            self.country_submenu.append(item)
+            sub.append(item)
         else:
             item = Gtk.MenuItem(label="(no countries available)")
             item.set_sensitive(False)
-            self.country_submenu.append(item)
+            sub.append(item)
 
-        self.country_submenu.show_all()
+        sub.show_all()
+        return sub
 
     def _make_country_connect_handler(self, code):
         def handler(widget):
-            self._run_vpn_action(
-                ["disconnect"],
-                CMD_TIMEOUT_DISCONNECT,
-                "Disconnecting",
-                on_done=lambda ret, out, err: self._run_vpn_action(
-                    ["connect", "--country", code],
-                    CMD_TIMEOUT_CONNECT,
-                    "Connecting to " + code,
-                    on_done=self._default_on_done,
-                ),
-            )
+            if not self.connected:
+                self._do_connect(["--country", code])
+            else:
+                self._run_vpn_action(
+                    ["disconnect"],
+                    CMD_TIMEOUT_DISCONNECT,
+                    "Disconnecting",
+                    on_done=lambda ret, out, err: self._do_connect(["--country", code]),
+                )
         return handler
 
-    # ── Settings submenu ───────────────────────────────────────────────
-
-    def _on_settings_submenu_show(self, widget):
-        self._rebuild_settings_submenu()
-
-    def _rebuild_settings_submenu(self):
-        for child in self.settings_submenu.get_children():
-            self.settings_submenu.remove(child)
-
-        loading = Gtk.MenuItem(label="Loading settings...")
-        loading.set_sensitive(False)
-        self.settings_submenu.append(loading)
-        self.settings_submenu.show_all()
-
-        def callback(ret, out, err):
-            GLib.idle_add(self._rebuild_settings_submenu_done, ret, out, err)
-
-        run_cli_async(["config", "list"], CMD_TIMEOUT_CONFIG, callback)
-
-    def _rebuild_settings_submenu_done(self, ret, out, err):
-        if self._quitting:
-            return
-        for child in self.settings_submenu.get_children():
-            self.settings_submenu.remove(child)
+    def _build_settings_menu(self):
+        sub = Gtk.Menu()
 
         settings = {}
-        if ret == 0:
-            settings = parse_config_list(out)
+        now = _time.time()
+        if self._config_cache and (now - self._config_cache_time) < CONFIG_CACHE_TTL:
+            settings = self._config_cache
+        else:
+            ret, out, err = run_cli(["config", "list"], CMD_TIMEOUT_CONFIG)
+            if ret == 0:
+                settings = parse_config_list(out)
+                self._config_cache = settings
+                self._config_cache_time = now
+            else:
+                settings = self._config_cache
 
-        self._add_setting_radio("NetShield", "netshield", settings,
+        if not settings:
+            item = Gtk.MenuItem(label="Could not read settings")
+            item.set_sensitive(False)
+            sub.append(item)
+            sub.show_all()
+            return sub
+
+        self._add_setting_radio(sub, "NetShield", "netshield", settings,
                                  ["off", "malware-only", "malware-ads-trackers"])
-        self._add_setting_radio("Kill Switch", "kill-switch", settings,
+        self._add_setting_radio(sub, "Kill Switch", "kill-switch", settings,
                                  ["off", "standard"])
-        self._add_setting_radio("VPN Accelerator", "vpn-accelerator", settings,
+        self._add_setting_radio(sub, "VPN Accelerator", "vpn-accelerator", settings,
                                  ["on", "off"])
-        self._add_setting_radio("IPv6", "ipv6", settings,
+        self._add_setting_radio(sub, "IPv6", "ipv6", settings,
                                  ["on", "off"])
-        self._add_setting_radio("Moderate NAT", "moderate-nat", settings,
+        self._add_setting_radio(sub, "Moderate NAT", "moderate-nat", settings,
                                  ["on", "off"])
-        self._add_setting_radio("Port Forwarding", "port-forwarding", settings,
+        self._add_setting_radio(sub, "Port Forwarding", "port-forwarding", settings,
                                  ["on", "off"])
-        self._add_setting_radio("Anonymous Crash Reports", "anonymous-crash-reports",
-                                 settings, ["on", "off"])
+        self._add_setting_radio(sub, "Anonymous Crash Reports",
+                                 "anonymous-crash-reports", settings, ["on", "off"])
 
-        self.settings_submenu.append(self._mk_sep())
+        sub.append(self._mk_sep())
 
         dns_item = Gtk.MenuItem(label="Custom DNS...")
         dns_item.connect("activate", self._on_custom_dns)
-        self.settings_submenu.append(dns_item)
+        sub.append(dns_item)
 
-        self.settings_submenu.show_all()
+        sub.show_all()
+        return sub
 
-    def _add_setting_radio(self, label, setting_key, current_settings, values):
+    def _add_setting_radio(self, parent_menu, label, setting_key, current_settings, values):
         parent = Gtk.MenuItem(label=label)
         sub = Gtk.Menu()
         parent.set_submenu(sub)
@@ -536,7 +595,7 @@ class ProtonVPNTray:
             sub.append(item)
 
         sub.show_all()
-        self.settings_submenu.append(parent)
+        parent_menu.append(parent)
 
     def _make_setting_handler(self, key, value):
         def handler(widget):
@@ -546,9 +605,10 @@ class ProtonVPNTray:
                 ["config", "set", key, value],
                 CMD_TIMEOUT_CONFIG_SET,
                 "Setting %s to %s" % (key, value),
-                on_done=lambda ret, out, err: notify(
-                    "VPN Settings",
-                    "%s set to %s" % (key, value),
+                on_done=lambda ret, out, err: (
+                    notify("VPN Settings", "%s set to %s" % (key, value))
+                    if ret == 0
+                    else notify("VPN Settings", "Failed: " + (err or out)[:80])
                 ),
             )
         return handler
@@ -559,7 +619,10 @@ class ProtonVPNTray:
                 [
                     "zenity", "--entry",
                     "--title", "Custom DNS",
-                    "--text", "Enter DNS server IPs (comma-separated):\n\nLeave empty to disable custom DNS.\n\nExample: 1.1.1.1,8.8.8.8",
+                    "--text",
+                    "Enter DNS server IPs (comma-separated):\n\n"
+                    "Leave empty to disable custom DNS.\n\n"
+                    "Example: 1.1.1.1,8.8.8.8",
                     "--width", "480",
                 ],
                 capture_output=True, text=True, timeout=60,
@@ -572,11 +635,16 @@ class ProtonVPNTray:
                     ["config", "set", "custom-dns", "off"],
                     CMD_TIMEOUT_CONFIG_SET,
                     "Disabling custom DNS",
-                    on_done=lambda ret, out, err: notify("Custom DNS", "Disabled"),
+                    on_done=lambda ret, out, err: notify(
+                        "Custom DNS", "Disabled"
+                    ),
                 )
             else:
-                # Normalize: strip spaces, join with commas
-                ips = [ip.strip() for ip in dns_input.replace(",", " ").split() if ip.strip()]
+                ips = [
+                    ip.strip()
+                    for ip in dns_input.replace(",", " ").split()
+                    if ip.strip()
+                ]
                 if not ips:
                     return
                 dns_arg = ",".join(ips)
@@ -585,13 +653,14 @@ class ProtonVPNTray:
                     CMD_TIMEOUT_CONFIG_SET,
                     "Setting custom DNS to " + dns_arg,
                     on_done=lambda ret, out, err: notify(
-                        "Custom DNS", "Set to: " + dns_arg if ret == 0 else "Failed: " + (err or "unknown error")
+                        "Custom DNS",
+                        "Set to: " + dns_arg
+                        if ret == 0
+                        else "Failed: " + (err or "unknown error"),
                     ),
                 )
         except Exception as e:
             log.warning("zenity custom DNS failed: %s", e)
-
-    # ── Status polling ─────────────────────────────────────────────────
 
     def _poll_status(self):
         if self.busy or self._polling:
@@ -638,9 +707,10 @@ class ProtonVPNTray:
             self.status_item.set_label(label)
 
             if hasattr(self.indicator, "set_title"):
-                self.indicator.set_title("Proton VPN — %s" % (
-                    "Connected" if self.connected else "Disconnected"
-                ))
+                self.indicator.set_title(
+                    "Proton VPN — %s"
+                    % ("Connected" if self.connected else "Disconnected")
+                )
 
             if self.connected and not old_connected:
                 notify("Proton VPN", "Connected to VPN")
@@ -649,8 +719,6 @@ class ProtonVPNTray:
 
         run_cli_async(["status"], CMD_TIMEOUT_STATUS, callback)
         return True
-
-    # ── Country loading ────────────────────────────────────────────────
 
     def _load_countries_async(self):
         def callback(ret, out, err):
@@ -661,29 +729,37 @@ class ProtonVPNTray:
                     self.countries_loaded = True
                     log.info("Loaded %d countries", len(parsed))
                 else:
-                    log.warning("Country parse returned empty list from output:\n%s", out[:200])
+                    log.warning(
+                        "Country parse returned empty list from output:\n%s",
+                        out[:200],
+                    )
             else:
                 log.warning("Failed to load countries: ret=%d err=%s", ret, err)
         run_cli_async(["countries", "list"], CMD_TIMEOUT_COUNTRIES, callback)
         return False
 
-    # ── Auto-connect ───────────────────────────────────────────────────
-
     def _auto_connect_startup(self):
         country = self.config.get("default_country", "CH")
-        self._run_vpn_action(
-            ["connect", "--country", country],
-            CMD_TIMEOUT_CONNECT,
-            "Auto-connecting to " + country,
-            on_done=lambda ret, out, err: (
-                notify("Proton VPN", "Auto-connected to " + country)
-                if ret == 0
-                else notify("Proton VPN", "Auto-connect failed: " + (err or out)[:80])
-            ),
-        )
+        self._do_connect(["--country", country], status_msg="Auto-connecting to " + country)
         return False
 
-    # ── VPN actions ────────────────────────────────────────────────────
+    def _do_connect(self, connect_args, status_msg=None):
+        args = ["connect"] + connect_args
+        if status_msg is None:
+            status_msg = "Connecting..."
+        self._run_vpn_action(
+            args,
+            CMD_TIMEOUT_CONNECT,
+            status_msg,
+            on_done=lambda ret, out, err: (
+                notify("Proton VPN", status_msg + " — Done")
+                if ret == 0
+                else notify(
+                    "Proton VPN",
+                    "Connect failed: " + ((err or out)[:80]),
+                )
+            ),
+        )
 
     def _run_vpn_action(self, args, timeout, status_msg, on_done=None):
         if self.busy:
@@ -709,47 +785,49 @@ class ProtonVPNTray:
             msg = (err or out)[:100] if (err or out) else "Unknown error"
             notify("Proton VPN", "Failed: " + msg)
 
-    # ── Menu action handlers ───────────────────────────────────────────
-
     def _on_connect_fastest(self, widget):
-        self._run_vpn_action(
-            ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
-            on_done=lambda ret, out, err: self._run_vpn_action(
-                ["connect"], CMD_TIMEOUT_CONNECT,
-                "Connecting (fastest)...",
-                on_done=self._default_on_done,
-            ),
-        )
+        if not self.connected:
+            self._do_connect([], status_msg="Connecting (fastest)...")
+        else:
+            self._run_vpn_action(
+                ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
+                on_done=lambda r, o, e: self._do_connect(
+                    [], status_msg="Connecting (fastest)..."
+                ),
+            )
 
     def _on_connect_securecore(self, widget):
-        self._run_vpn_action(
-            ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
-            on_done=lambda ret, out, err: self._run_vpn_action(
-                ["connect", "--securecore"], CMD_TIMEOUT_CONNECT,
-                "Connecting Secure Core...",
-                on_done=self._default_on_done,
-            ),
-        )
+        if not self.connected:
+            self._do_connect(["--securecore"], status_msg="Connecting Secure Core...")
+        else:
+            self._run_vpn_action(
+                ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
+                on_done=lambda r, o, e: self._do_connect(
+                    ["--securecore"], status_msg="Connecting Secure Core..."
+                ),
+            )
 
     def _on_connect_tor(self, widget):
-        self._run_vpn_action(
-            ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
-            on_done=lambda ret, out, err: self._run_vpn_action(
-                ["connect", "--tor"], CMD_TIMEOUT_CONNECT,
-                "Connecting Tor...",
-                on_done=self._default_on_done,
-            ),
-        )
+        if not self.connected:
+            self._do_connect(["--tor"], status_msg="Connecting Tor...")
+        else:
+            self._run_vpn_action(
+                ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
+                on_done=lambda r, o, e: self._do_connect(
+                    ["--tor"], status_msg="Connecting Tor..."
+                ),
+            )
 
     def _on_connect_p2p(self, widget):
-        self._run_vpn_action(
-            ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
-            on_done=lambda ret, out, err: self._run_vpn_action(
-                ["connect", "--p2p"], CMD_TIMEOUT_CONNECT,
-                "Connecting P2P...",
-                on_done=self._default_on_done,
-            ),
-        )
+        if not self.connected:
+            self._do_connect(["--p2p"], status_msg="Connecting P2P...")
+        else:
+            self._run_vpn_action(
+                ["disconnect"], CMD_TIMEOUT_DISCONNECT, "Disconnecting",
+                on_done=lambda r, o, e: self._do_connect(
+                    ["--p2p"], status_msg="Connecting P2P..."
+                ),
+            )
 
     def _on_disconnect(self, widget):
         self._run_vpn_action(
@@ -794,7 +872,9 @@ class ProtonVPNTray:
                 args.append(cname)
 
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=60
+            )
             selected = result.stdout.strip()
             if result.returncode == 0 and selected:
                 self.config["default_country"] = selected
@@ -827,9 +907,15 @@ class ProtonVPNTray:
             args.append(cname)
 
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=60
+            )
             if result.returncode == 0:
-                selected = [s.strip() for s in result.stdout.strip().split(",") if s.strip()]
+                selected = [
+                    s.strip()
+                    for s in result.stdout.strip().split(",")
+                    if s.strip()
+                ]
                 self.config["favorites"] = selected
                 self._save_config()
                 notify("Favorites", "Updated (%d favorites)" % len(selected))
@@ -842,25 +928,32 @@ class ProtonVPNTray:
 
     def _on_show_info(self, widget):
         def callback(ret, out, err):
-            if ret != 0:
-                text = "Failed: " + (err or out or "Unknown error")
+            parts = ["═══ Proton VPN Account ═══"]
+            if ret == 0:
+                parts.append(out)
             else:
-                text = out
-            GLib.idle_add(self._show_info_dialog, text)
+                parts.append("CLI error: " + (err or out or "Unknown error"))
+            parts.append("")
+            parts.append("═══ Network Diagnostics ═══")
+            parts.append("Collecting network details...")
+            GLib.idle_add(self._show_info_dialog, "\n\n".join(parts))
         run_cli_async(["info"], CMD_TIMEOUT_INFO, callback)
 
-    def _show_info_dialog(self, text):
+    def _show_info_dialog(self, vpn_text):
         if self._quitting:
             return
+        net_text = _collect_network_details()
+        full = vpn_text + "\n\n" + net_text
+
         try:
             subprocess.run(
                 [
                     "zenity", "--text-info",
                     "--title", "Proton VPN — Connection Info",
-                    "--width", "550", "--height", "400",
+                    "--width", "700", "--height", "500",
                     "--font=monospace",
                 ],
-                input=text, text=True, timeout=30,
+                input=full, text=True, timeout=60,
             )
         except Exception as e:
             log.warning("zenity info failed: %s", e)
@@ -892,6 +985,8 @@ class ProtonVPNTray:
     def _on_refresh(self, widget):
         self.countries_loaded = False
         self.countries_cache = []
+        self._config_cache = {}
+        self._config_cache_time = 0
         GLib.idle_add(self._poll_status)
         GLib.timeout_add(500, self._load_countries_async)
         notify("Proton VPN", "Refreshing...")
@@ -899,8 +994,6 @@ class ProtonVPNTray:
     def _on_quit(self, widget):
         notify("Proton VPN", "Tray closed (VPN stays connected if active)")
         self._shutdown()
-
-    # ── Main loop ──────────────────────────────────────────────────────
 
     def run(self):
         Gtk.main()
@@ -911,8 +1004,9 @@ def main():
         description="Proton VPN System Tray for Linux Mint MATE"
     )
     parser.add_argument(
-        "--auto-connect", action="store_true",
-        help="Auto-connect to default country on startup"
+        "--auto-connect",
+        action="store_true",
+        help="Auto-connect to default country on startup",
     )
     args = parser.parse_args()
 
