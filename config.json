@@ -1,6 +1,6 @@
 {
   "default_country": "CH",
   "auto_connect_on_start": true,
-  "favorites": ["CH", "DE"],
+  "favorites": ["CH", "PA", "IS"],
   "last_connected": null
 }

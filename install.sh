@@ -7,8 +7,9 @@
 #   2. Adds the Proton VPN repository and installs the CLI if missing
 #   3. Creates the config directory
 #   4. Makes scripts executable
-#   5. Enables auto-start on login
-#   6. Verifies Proton VPN sign-in status
+#   5. Installs pre-commit secrets scanner hook
+#   6. Enables auto-start on login
+#   7. Verifies Proton VPN sign-in status
 
 set -euo pipefail
 
@@ -21,7 +22,7 @@ echo "============================================"
 echo ""
 
 # --- 1. System dependencies ---
-echo "[1/5] Installing system dependencies..."
+echo "[1/6] Installing system dependencies..."
 
 PACKAGES="python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 zenity"
 
@@ -41,7 +42,7 @@ else
 fi
 
 # --- 2. Proton VPN CLI ---
-echo "[2/5] Verifying Proton VPN CLI..."
+echo "[2/6] Verifying Proton VPN CLI..."
 
 if ! command -v protonvpn &>/dev/null; then
     echo "  Proton VPN CLI not found. Installing..."
@@ -63,7 +64,7 @@ else
 fi
 
 # --- 3. Config directory ---
-echo "[3/5] Setting up configuration..."
+echo "[3/6] Setting up configuration..."
 
 mkdir -p "$CONFIG_DIR"
 
@@ -75,15 +76,21 @@ else
 fi
 
 # --- 4. Make scripts executable ---
-echo "[4/5] Setting executable permissions..."
+echo "[4/6] Setting executable permissions..."
 
 chmod +x "$SCRIPT_DIR/protonvpn-tray.py"
 chmod +x "$SCRIPT_DIR/enable-autostart.sh"
 chmod +x "$SCRIPT_DIR/disable-autostart.sh"
 chmod +x "$SCRIPT_DIR/install.sh"
+chmod +x "$SCRIPT_DIR/pre-commit-hook"
 
-# --- 5. Enable autostart ---
-echo "[5/5] Enabling auto-start on login..."
+# --- 5. Install pre-commit hook ---
+echo "[5/6] Installing pre-commit secrets scanner..."
+cp "$SCRIPT_DIR/pre-commit-hook" "$SCRIPT_DIR/.git/hooks/pre-commit"
+echo "  Pre-commit secrets scanner installed."
+
+# --- 6. Enable autostart ---
+echo "[6/6] Enabling auto-start on login..."
 
 "$SCRIPT_DIR/enable-autostart.sh"
 

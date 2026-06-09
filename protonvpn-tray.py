@@ -42,7 +42,7 @@ DISABLE_AUTOSTART_SH = os.path.join(SCRIPT_DIR, "disable-autostart.sh")
 DEFAULT_CONFIG = {
     "default_country": "CH",
     "auto_connect_on_start": True,
-    "favorites": ["CH", "DE"],
+    "favorites": ["CH", "PA", "IS"],
     "last_connected": None,
 }
 
@@ -186,7 +186,7 @@ def notify(title, body, icon="network-vpn"):
 
 
 def _collect_network_details():
-    """Gather real IP, VPN IP, and network adapter info for diagnostics."""
+    """Gather VPN IP and network adapter info for diagnostics."""
     details = []
 
     try:
@@ -212,17 +212,6 @@ def _collect_network_details():
 
     try:
         result = subprocess.run(
-            ["curl", "-s", "--max-time", "5", "https://api.ipify.org"],
-            capture_output=True, text=True, timeout=8,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            details.append("--- Real Public IP ---")
-            details.append(result.stdout.strip())
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
             ["curl", "-s", "--max-time", "5", "https://vpn-api.proton.me/vpn/logicals"],
             capture_output=True, text=True, timeout=8,
         )
@@ -237,6 +226,18 @@ def _collect_network_details():
         details.append("(curl not available)")
 
     return "\n\n".join(details)
+
+
+def _spawn_xdotool_raise(title):
+    def _do():
+        try:
+            subprocess.run(
+                ["xdotool", "search", "--sync", "--name", title, "windowactivate"],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
 
 
 class ProtonVPNTray:
@@ -431,7 +432,7 @@ class ProtonVPNTray:
         menu.append(self._mk_sep())
 
         autostart_enabled = is_autostart_enabled()
-        label = "Autostart (%s)" % ("Enabled" if autostart_enabled else "Disabled")
+        label = "Turn off autostart (now enabled)" if autostart_enabled else "Turn on autostart (now disabled)"
         self.autostart_item = Gtk.MenuItem(label=label)
         self.autostart_item.connect("activate", self._on_toggle_autostart)
         menu.append(self.autostart_item)
@@ -615,6 +616,7 @@ class ProtonVPNTray:
 
     def _on_custom_dns(self, widget):
         try:
+            _spawn_xdotool_raise("Custom DNS")
             result = subprocess.run(
                 [
                     "zenity", "--entry",
@@ -872,6 +874,7 @@ class ProtonVPNTray:
                 args.append(cname)
 
         try:
+            _spawn_xdotool_raise("Default Country")
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=60
             )
@@ -907,6 +910,7 @@ class ProtonVPNTray:
             args.append(cname)
 
         try:
+            _spawn_xdotool_raise("Manage Favorites")
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=60
             )
@@ -927,13 +931,44 @@ class ProtonVPNTray:
             log.warning("zenity favorites failed: %s", e)
 
     def _on_show_info(self, widget):
+        connection_status = self.connection_info
+
         def callback(ret, out, err):
-            parts = ["═══ Proton VPN Account ═══"]
+            parts = []
+            vpn_lines = [connection_status or self.status_raw or "Unknown"]
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", "5", "https://api.ipify.org"],
+                    capture_output=True, text=True, timeout=8,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    vpn_lines.append("Real IP: " + r.stdout.strip())
+            except Exception:
+                pass
+            try:
+                r = subprocess.run(
+                    ["ip", "-4", "addr", "show"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    for line in r.stdout.split("\n"):
+                        if "inet " in line:
+                            cols = line.strip().split()
+                            iface = cols[-1]
+                            if "tun" in iface or "proton" in iface:
+                                vpn_lines.append(
+                                    "VPN IP: " + cols[1].split("/")[0]
+                                )
+                                break
+            except Exception:
+                pass
+            parts.append("═══ VPN Connection ═══")
+            parts.append("\n".join(vpn_lines))
+            parts.append("═══ Proton VPN Account ═══")
             if ret == 0:
                 parts.append(out)
             else:
                 parts.append("CLI error: " + (err or out or "Unknown error"))
-            parts.append("")
             parts.append("═══ Network Diagnostics ═══")
             parts.append("Collecting network details...")
             GLib.idle_add(self._show_info_dialog, "\n\n".join(parts))
@@ -946,15 +981,26 @@ class ProtonVPNTray:
         full = vpn_text + "\n\n" + net_text
 
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "zenity", "--text-info",
                     "--title", "Proton VPN — Connection Info",
                     "--width", "700", "--height", "500",
                     "--font=monospace",
                 ],
-                input=full, text=True, timeout=60,
+                stdin=subprocess.PIPE, text=True,
             )
+            proc.stdin.write(full)
+            proc.stdin.close()
+            try:
+                subprocess.run(
+                    ["xdotool", "search", "--sync", "--name",
+                     "Proton VPN — Connection Info", "windowactivate"],
+                    timeout=10,
+                )
+            except Exception:
+                pass
+            proc.wait(timeout=60)
         except Exception as e:
             log.warning("zenity info failed: %s", e)
 
