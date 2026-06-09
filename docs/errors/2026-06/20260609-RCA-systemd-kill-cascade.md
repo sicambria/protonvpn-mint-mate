@@ -130,21 +130,18 @@ Python caches compiled bytecode in `__pycache__/protonvpn-tray.cpython-312.pyc`.
 
 ## Timeline (actual, from coredump timestamps)
 
-| Time (CEST) | Event |
-|-------------|-------|
-| **Boot 1 (June 9)** | |
-| 23:48 | Login, tray starts with old code (no circuit breaker) |
-| 23:48–23:59 | ~15 crashes, 16 MB coredumps each |
-| ~23:59 | systemd user manager becomes unresponsive, PID 1 sends SIGKILL |
-| 23:59 | User logged out, drops to LightDM greeter |
-| **Boot 2 (June 10)** | |
-| 00:07 | Login, tray starts with v1 circuit breaker code |
-| 00:07–00:10 | Circuit breaker never fires — SIGABRT hits success path, resets `_failure_count = 0` every time |
-| 00:10+ | ~33 more crashes, 48 total across both boots |
-| 00:10 | **User session alive because I inspect the system during this session** |
-| (ongoing) | Circuit breaker code fixed with `proc.returncode < 0` check |
-
-**Totals: 48 coredumps, ~812 MB written to `/var/lib/systemd/coredump/`**
+| Relative time | Event |
+|---------------|-------|
+| **Boot 1 (old code: no circuit breaker)** | |
+| T+0s | Login, tray starts with old code |
+| T+0s–T+660s | ~15 crashes, 16 MB coredumps each |
+| ~T+660s | systemd user manager becomes unresponsive, PID 1 sends SIGKILL |
+| ~T+660s | User logged out, drops to LightDM greeter |
+| **Boot 2 (v1 circuit breaker — buggy: SIGABRT not detected)** | |
+| T+0s | Login, tray starts with v1 circuit breaker code |
+| T+0s–T+180s | Circuit breaker never fires — SIGABRT hits success path, resets `_failure_count = 0` every time |
+| T+180s+ | ~33 more crashes, 48 total across both boots |
+| **Total: 48 coredumps, ~812 MB written to `/var/lib/systemd/coredump/`** | |
 
 ---
 
