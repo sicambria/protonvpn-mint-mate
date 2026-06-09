@@ -199,6 +199,7 @@ class ProtonVPNTray:
         self.country_submenu = None
         self.autostart_item = None
         self._polling = False
+        self._quitting = False
 
         self._check_pid()
         self._write_pid()
