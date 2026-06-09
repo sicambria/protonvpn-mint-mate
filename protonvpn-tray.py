@@ -229,6 +229,37 @@ def _collect_network_details():
     return "\n\n".join(details)
 
 
+def _show_text_dialog(title, text, width=700, height=500):
+    win = Gtk.Window(title=title, modal=True, default_width=width, default_height=height)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_border_width(8)
+
+    scrolled = Gtk.ScrolledWindow()
+    scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    label = Gtk.Label(label=text, selectable=False, wrap=False, halign=Gtk.Align.START, valign=Gtk.Align.START)
+    label.set_margin_left(6)
+    label.set_margin_right(6)
+    label.set_margin_top(6)
+    label.set_margin_bottom(6)
+    override_font = Gtk.CssProvider()
+    override_font.load_from_data(b"label { font-family: monospace; }")
+    label.get_style_context().add_provider(override_font, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    scrolled.add(label)
+
+    btn = Gtk.Button(label="Close")
+    btn.connect("clicked", lambda _: win.destroy())
+    btn.set_halign(Gtk.Align.CENTER)
+    btn.set_margin_top(8)
+    btn.set_margin_bottom(4)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    vbox.pack_start(scrolled, True, True, 0)
+    vbox.pack_start(btn, False, False, 0)
+    win.add(vbox)
+    win.show_all()
+    win.present()
+
+
 def _raise_window(title):
     for cmd in [
         ["wmctrl", "-a", title],
@@ -1001,24 +1032,7 @@ class ProtonVPNTray:
         net_text = _collect_network_details()
         full = vpn_text + "\n\n" + net_text
 
-        try:
-            proc = subprocess.Popen(
-                [
-                    "zenity", "--text-info",
-                    "--title", "Proton VPN — Connection Info",
-                    "--width", "700", "--height", "500",
-                    "--font=monospace",
-                    "--ok-label=Close",
-                    "--cancel-label=",
-                ],
-                stdin=subprocess.PIPE, text=True,
-            )
-            proc.stdin.write(full)
-            proc.stdin.close()
-            _raise_window("Proton VPN — Connection Info")
-            proc.wait(timeout=60)
-        except Exception as e:
-            log.warning("zenity info failed: %s", e)
+        _show_text_dialog("Proton VPN — Connection Info", full)
 
     def _on_toggle_autostart(self, widget):
         if is_autostart_enabled():
