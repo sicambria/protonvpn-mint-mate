@@ -272,6 +272,7 @@ class ProtonVPNTray:
     def _shutdown(self):
         global _notify_initialized
         _notify_initialized = False
+        self._quitting = True
         self._remove_pid()
         try:
             Notify.uninit()
@@ -479,6 +480,8 @@ class ProtonVPNTray:
         run_cli_async(["config", "list"], CMD_TIMEOUT_CONFIG, callback)
 
     def _rebuild_settings_submenu_done(self, ret, out, err):
+        if self._quitting:
+            return
         for child in self.settings_submenu.get_children():
             self.settings_submenu.remove(child)
 
@@ -596,6 +599,8 @@ class ProtonVPNTray:
 
         def callback(ret, out, err):
             self._polling = False
+            if self._quitting:
+                return
             state, info = parse_status(out)
             old_connected = self.connected
             old_signed_in = self.signed_in
@@ -689,6 +694,8 @@ class ProtonVPNTray:
 
         def callback(ret, out, err):
             self.busy = False
+            if self._quitting:
+                return
             GLib.idle_add(self._poll_status)
             if on_done:
                 on_done(ret, out, err)
@@ -842,6 +849,8 @@ class ProtonVPNTray:
         run_cli_async(["info"], CMD_TIMEOUT_INFO, callback)
 
     def _show_info_dialog(self, text):
+        if self._quitting:
+            return
         try:
             subprocess.run(
                 [
