@@ -186,6 +186,14 @@ _scan_content() {
 		fi
 
 	done <<< "$content"
+
+	# The loop's last command is `[ -n "$ts_found" ] && _print_violation`,
+	# which returns 1 on any line without a timestamp (the common case). Under
+	# `set -e` that non-zero return from this function aborts the whole hook
+	# with exit 1 *before* the violation summary or the success line prints —
+	# blocking clean commits. Always return success; real violations are
+	# tracked via the VIOLATIONS counter, not this function's exit status.
+	return 0
 }
 
 # ── File classification ─────────────────────────────────────────
