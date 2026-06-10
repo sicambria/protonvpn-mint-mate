@@ -53,17 +53,20 @@ CMD_TIMEOUT_COUNTRIES = 45
 CMD_TIMEOUT_CONFIG = 8
 CMD_TIMEOUT_INFO = 15
 CMD_TIMEOUT_CONFIG_SET = 8
-CONFIG_CACHE_TTL = 5
+CONFIG_CACHE_TTL = 15
+POLL_MIN_INTERVAL = 4          # minimum seconds between status polls
+_MAX_CONSECUTIVE_TIMEOUTS = 3  # consecutive timeouts before breaker trip
 
 _MAX_FAILURES = 10
 _failure_count = 0
+_consecutive_timeouts = 0
 _polling_paused = False
 _polling_paused_notified = False
 _cli_lock = threading.Lock()
 
 
 def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
-    global _failure_count, _polling_paused, _polling_paused_notified
+    global _failure_count, _consecutive_timeouts, _polling_paused, _polling_paused_notified
     with _cli_lock:
         if _failure_count > 3:
             delay = min(0.5 * (2 ** (_failure_count - 3)), 30)
@@ -87,12 +90,19 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
                             " ".join(args), -proc.returncode, _failure_count)
                 return proc.returncode, out.strip(), err.strip()
             _failure_count = 0
+            _consecutive_timeouts = 0
             _polling_paused = False
             _polling_paused_notified = False
             return proc.returncode, out.strip(), err.strip()
         except subprocess.TimeoutExpired:
             _failure_count += 1
-            if _failure_count >= _MAX_FAILURES and not _polling_paused:
+            _consecutive_timeouts += 1
+            if _consecutive_timeouts >= _MAX_CONSECUTIVE_TIMEOUTS and not _polling_paused:
+                _polling_paused = True
+                log.warning("protonvpn %s timed out %d times consecutively — "
+                            "circuit breaker tripped",
+                            " ".join(args), _consecutive_timeouts)
+            elif _failure_count >= _MAX_FAILURES and not _polling_paused:
                 _polling_paused = True
             if proc is not None:
                 try:
@@ -288,6 +298,7 @@ def _collect_network_details():
 def _show_text_dialog(title, text, width=700, height=500):
     win = Gtk.Window(title=title, modal=True, default_width=width, default_height=height)
     win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_keep_above(True)
     win.set_border_width(8)
 
     scrolled = Gtk.ScrolledWindow()
@@ -355,6 +366,7 @@ class ProtonVPNTray:
         self._info_label = None
         self._config_cache = {}
         self._config_cache_time = 0
+        self._last_poll_time = 0
 
         self._check_pid()
         self._write_pid()
@@ -779,10 +791,14 @@ class ProtonVPNTray:
             return True
         if self.busy or self._polling:
             return True
+        now = _time.monotonic()
+        if self._last_poll_time > 0 and (now - self._last_poll_time) < POLL_MIN_INTERVAL:
+            return True
         self._polling = True
 
         def callback(ret, out, err):
             self._polling = False
+            self._last_poll_time = _time.monotonic()
             if self._quitting:
                 return
             state, info = parse_status(out)
@@ -1071,7 +1087,6 @@ class ProtonVPNTray:
                 + "═══ Network Diagnostics ═══\n"
                 + "Collecting network details..."
             ),
-            400, 200,
         )
         self._info_dialog_active = True
 
@@ -1178,8 +1193,14 @@ class ProtonVPNTray:
         dlg.set_copyright("Copyright (C) 2026  protonvpn-mint-mate contributors")
         dlg.set_license_type(Gtk.License.GPL_3_0)
         dlg.set_authors(["protonvpn-mint-mate contributors"])
+        dlg.add_credit_section(
+            "Related Projects",
+            ["Proton VPN CLI — https://github.com/ProtonVPN/proton-vpn-cli"],
+        )
         dlg.set_position(Gtk.WindowPosition.CENTER)
         dlg.set_modal(True)
+        dlg.set_keep_above(True)
+        dlg.present()
         dlg.run()
         dlg.destroy()
 

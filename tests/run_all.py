@@ -7,11 +7,15 @@ Usage:
 """
 
 import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 orig_exit = sys.exit
 sys.exit = lambda code: None
 
-import tests.test_tray          # 337 checks
-import tests.test_coverage_gaps # 140 checks
+import tests.test_tray                # 337 checks
+import tests.test_coverage_gaps       # 140 checks
+import tests.test_high_cpu_analysis   # 240 checks
 
 sys.exit = orig_exit

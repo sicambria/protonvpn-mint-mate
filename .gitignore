@@ -6,6 +6,9 @@ __pycache__/
 # Config (user-specific, tracked via template)
 ~/.config/protonvpn-tray/
 
+# RCA documents (gitignored — contain live system state)
+docs/errors/*/20260610-*
+
 # Coverage
 .coverage
 *,cover

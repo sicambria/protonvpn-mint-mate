@@ -84,6 +84,9 @@ chmod +x "$SCRIPT_DIR/disable-autostart.sh"
 chmod +x "$SCRIPT_DIR/install.sh"
 chmod +x "$SCRIPT_DIR/pre-commit-hook"
 
+# Clear stale bytecode cache so source edits take effect immediately
+find "$SCRIPT_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 # --- 5. Install pre-commit hook ---
 echo "[5/6] Installing pre-commit secrets scanner..."
 cp "$SCRIPT_DIR/pre-commit-hook" "$SCRIPT_DIR/.git/hooks/pre-commit"

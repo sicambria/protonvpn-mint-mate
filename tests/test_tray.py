@@ -880,6 +880,7 @@ def make_tray():
     tray._quitting = False
     tray._config_cache = {}
     tray._config_cache_time = 0
+    tray._last_poll_time = 0
     tray._status_icon = None
     return tray
 
