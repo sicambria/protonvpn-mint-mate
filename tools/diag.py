@@ -110,6 +110,37 @@ def check_source_constants():
     return constants
 
 
+def check_tray_freshness(pid_info):
+    """Compare each running tray PID's start time to the source file's
+    mtime. Flags processes that started before the latest source edit
+    (likely running stale bytecode)."""
+    if not pid_info:
+        return None
+    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = os.path.join(proj_root, "protonvpn-tray.py")
+    try:
+        src_mtime = os.path.getmtime(src)
+    except OSError:
+        return None
+    results = []
+    for pi in pid_info:
+        pid = pi["pid"]
+        try:
+            etimes = int(subprocess.check_output(
+                ["ps", "-p", pid, "-o", "etimes=", "--no-headers"],
+                text=True, timeout=2).strip())
+            proc_start = time.time() - etimes
+            results.append({
+                "pid": pid,
+                "proc_start": proc_start,
+                "src_mtime": src_mtime,
+                "stale": proc_start < src_mtime,
+            })
+        except Exception:
+            continue
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Proton VPN Tray system diagnostic"
@@ -123,6 +154,9 @@ def main():
     running, pid_info = check_tray()
     results["tray_running"] = running
     results["tray_pids"] = pid_info
+
+    freshness = check_tray_freshness(pid_info)
+    results["tray_freshness"] = freshness
 
     autostart, autostart_path = check_autostart()
     results["autostart_enabled"] = autostart
@@ -144,6 +178,12 @@ def main():
     issues = []
     if running:
         issues.append("Tray is running → pkill -f protonvpn-tray.py")
+    if freshness:
+        for f in freshness:
+            if f["stale"]:
+                issues.append(
+                    "Live tray PID %s started before latest source change "
+                    "→ restart it" % f["pid"])
     if autostart:
         issues.append("Autostart enabled → ./disable-autostart.sh")
     if pycs:
@@ -169,6 +209,11 @@ def main():
     if pid_info:
         for pi in pid_info:
             print(f"            PID {pi['pid']}: {pi['ps']}")
+    if freshness:
+        for f in freshness:
+            age = "BEFORE" if f["stale"] else "after"
+            print(f"            PID {f['pid']}: started {age} last source edit"
+                  + (" — likely stale bytecode, restart it" if f["stale"] else ""))
 
     print(f"Autostart:  {'ENABLED' if autostart else 'disabled'}")
     print(f"Stale .pyc: {len(pycs)} file(s)" +

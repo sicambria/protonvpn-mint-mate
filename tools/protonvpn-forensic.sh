@@ -27,7 +27,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-FORENSIC_BASE="/tmp/protonvpn-forensic"
+# Persistent location — /tmp is wiped at boot (tmpfiles.d "D /tmp"), which
+# would destroy the evidence when the expected crash reboots the machine.
+FORENSIC_BASE="${PROTONVPN_FORENSIC_BASE:-$HOME/.local/share/protonvpn-forensic}"
 FORENSIC_DIR=""
 STATE_FILE=""
 PHASE_FILE=""
@@ -66,15 +68,28 @@ _ensure_project_root() {
     fi
 }
 
+# fdatasync the given files so they survive a kernel panic / hard freeze
+# (this machine panics+reboots on lockup: hung_task_panic=1, panic=10).
+_sync_files() {
+    sync -d "$@" 2>/dev/null || sync
+}
+
 _done_phase() {
     local phase="$1"
-    echo "$phase" > "$PHASE_FILE"
-    echo "done" >> "$STATE_FILE"
+    if [ -n "${PHASE_FILE:-}" ]; then
+        echo "done:$phase $(date -Iseconds)" > "$PHASE_FILE"
+        echo "done" >> "$STATE_FILE"
+        _sync_files "$PHASE_FILE" "$STATE_FILE"
+    fi
     echo -e "${GREEN}✓ Phase $phase completed${NC}"
 }
 
 _phase_started() {
     local phase="$1"
+    if [ -n "${PHASE_FILE:-}" ]; then
+        echo "running:$phase $(date -Iseconds)" > "$PHASE_FILE"
+        _sync_files "$PHASE_FILE"
+    fi
     echo -e "\n${BLUE}${BOLD}═══ Phase $phase ═══${NC}\n"
     logger "phase_start" "$phase"
 }
@@ -82,12 +97,14 @@ _phase_started() {
 _running()   { echo -e "${GREEN}[RUNNING]${NC} $*"; }
 _warn()      { echo -e "${YELLOW}[WARN]${NC} $*"; }
 _fatal()     { echo -e "${RED}${BOLD}[FATAL]${NC} $*"; exit 1; }
-_section()   { echo -e "\n${BOLD}--- $* ---${NC}"; }
+_section()   { echo -e "\n${BOLD}--- $* ---${NC}"; logger "section" "$*"; }
 _ok()        { echo -e "  ${GREEN}OK:${NC} $*"; }
 
 logger() {
+    [ -n "${FORENSIC_DIR:-}" ] && [ -d "$FORENSIC_DIR" ] || return 0
     local level="$1"; shift
     printf "[%s] [%s] %s\n" "$(date -Iseconds)" "$level" "$*" >> "$FORENSIC_DIR/forensic.log"
+    sync -d "$FORENSIC_DIR/forensic.log" 2>/dev/null || true
 }
 
 # ── Help ─────────────────────────────────────────────────────────
@@ -160,6 +177,34 @@ _clear_pycache() {
     _running "Clearing .pyc caches..."
     find "$PROJECT_ROOT" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
     _ok "Bytecode caches cleared"
+}
+
+_restart_tray_fresh() {
+    _section "Ensuring tray is running fresh, post-fix code"
+    if _tray_alive; then
+        _running "Live tray detected (PID $(_tray_pid)) — restarting with fresh code..."
+    else
+        _running "No tray currently running — starting fresh..."
+    fi
+    _kill_tray
+    _clear_pycache
+    cd "$PROJECT_ROOT"
+    # NO --auto-connect: it triggers the zenity country/favorites modal storm
+    # and real VPN connects, which (a) churn the X/GPU display path and (b)
+    # block SIGTERM (a tray wedged in a zenity nested loop ignores the kill and
+    # leaks). The 5 s status poll still exercises run_cli / the circuit breaker.
+    # See docs/errors/2026-06/20260610-RCA-system-freeze-during-test-runs.md
+    nohup python3 protonvpn-tray.py > /dev/null 2>&1 &
+    disown
+    local new_pid=$!
+    sleep 2
+    if _tray_alive; then
+        _ok "Tray running fresh (PID $new_pid)"
+        logger "restart_tray_fresh" "tray restarted PID=$new_pid"
+    else
+        _warn "Tray did not stay alive after restart — check protonvpn status / journal"
+        logger "restart_tray_fresh" "tray restart FAILED — process exited"
+    fi
 }
 
 _dump_baseline() {
@@ -309,10 +354,9 @@ _stop_monitors() {
 # ── Phase 0: Instrumentation Layer ───────────────────────────────
 
 phase0() {
-    _phase_started "0 — Instrumentation Layer"
     _ensure_project_root
     _init_forensic_dir
-    mkdir -p "$FORENSIC_DIR"
+    _phase_started "0 — Instrumentation Layer"
 
     _section "0a. Forensic directory"
     echo "Forensic dir: $FORENSIC_DIR"
@@ -337,7 +381,10 @@ phase0() {
     _section "0f. Popen instrumentation"
     _instrument_popen
 
-    _section "0g. CLI health pre-check"
+    _section "0g. Ensure tray running fresh post-fix code"
+    _restart_tray_fresh
+
+    _section "0h. CLI health pre-check"
     if [ "${SKIP_CLI_CHECK:-}" = "1" ]; then
         _warn "Skipping CLI health check (SKIP_CLI_CHECK=1)"
     else
@@ -353,7 +400,7 @@ phase0() {
         (timeout 10 protonvpn countries list > /dev/null 2>&1 && _ok "protonvpn countries list: OK") || _warn "protonvpn countries list: FAILED"
     fi
 
-    _section "0h. Save check-logout.py helper"
+    _section "0i. Save check-logout.py helper"
     PYTHON3_PATH=$(which python3)
     cat > "$FORENSIC_DIR/check-logout.py" << 'PYEOF'
 #!/usr/bin/env python3
@@ -473,7 +520,8 @@ phase2() {
     cd "$PROJECT_ROOT"
 
     if ! _tray_alive; then
-        _fatal "Phase 2 requires a LIVE tray. Start it first: python3 protonvpn-tray.py &"
+        _warn "No live tray detected. Phase 0 should have started one."
+        _fatal "Phase 2 requires a LIVE tray. Run: ./tools/protonvpn-forensic.sh phase0  (or manually: python3 protonvpn-tray.py &)"
     fi
     _ok "Tray is alive — proceeding with Phase 2"
 
@@ -602,8 +650,10 @@ phase3b() {
 
     _clear_pycache
 
-    _section "Starting fresh tray with --auto-connect"
-    python3 protonvpn-tray.py --auto-connect > /dev/null 2>&1 &
+    _section "Starting fresh tray (status-poll only, no --auto-connect)"
+    # No --auto-connect — see _restart_tray_fresh. The breaker trips on repeated
+    # `protonvpn status` failures from the 5 s poll, which runs regardless.
+    python3 protonvpn-tray.py > /dev/null 2>&1 &
     local TRAY_PID=$!
     echo "Tray PID: $TRAY_PID"
     logger "phase3b" "tray started with PID $TRAY_PID"
@@ -682,7 +732,10 @@ print(m._polling_paused)" 2>/dev/null) || still_paused="ERROR"
         echo "  If CLI is healthy, the breaker has nothing to trip on."
     fi
 
-    kill "$TRAY_PID" 2>/dev/null || true
+    # Robust teardown: SIGTERM then SIGKILL fallback. A bare `kill` (SIGTERM)
+    # can be ignored by a tray wedged in a nested GTK/zenity loop, leaking the
+    # process. _kill_tray escalates to SIGKILL and verifies death.
+    _kill_tray
     _done_phase "3b"
 }
 
@@ -935,11 +988,37 @@ status() {
 
 # ── All ──────────────────────────────────────────────────────────
 
+_all_exit_cleanup() {
+    # Safety net for the single-process `all` run: guarantee nothing the
+    # protocol spawned outlives the script — even on Ctrl-C, error, or the
+    # expected crash mid-run. Without this, an interrupted run leaks a live
+    # tray (the 2026-06-10 modal-storm) and the journal/coredump monitors.
+    _stop_monitors 2>/dev/null || true
+    pkill -f "protonvpn-tray\\.py" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "protonvpn-tray\\.py" 2>/dev/null || true
+}
+
 all() {
     echo -e "${BOLD}=== Proton VPN Tray — Forensic Protocol (All Phases) ===${NC}"
     echo "Recommended order: 0 → 1 → 2 → 3 → 3b → cleanup"
     echo ""
+    # Only `all` traps EXIT — standalone phase0/phase1/… invocations must leave
+    # the tray running for the next invocation, so they intentionally do NOT.
+    trap '_all_exit_cleanup' EXIT INT TERM
     phase0 || { _warn "Phase 0 had issues, continuing..."; }
+
+    # Background fdatasync loop: flushes all forensic logs every second so
+    # a hard freeze / kernel panic loses at most ~1s of evidence (page
+    # cache is otherwise lost). Self-terminates when this script exits.
+    (
+        while kill -0 $$ 2>/dev/null; do
+            sync -d "$FORENSIC_DIR"/*.log "$FORENSIC_DIR"/.current_phase 2>/dev/null || true
+            sleep 1
+        done
+    ) &
+    disown
+
     phase1 || { _warn "Phase 1 had issues, continuing..."; }
     phase2 || { _warn "Phase 2 had issues, continuing..."; }
     phase3 || { _warn "Phase 3 had issues, continuing..."; }
@@ -949,6 +1028,24 @@ all() {
 }
 
 # ── Main dispatcher ──────────────────────────────────────────────
+
+# Resume the most recent forensic session for commands that need an
+# existing dir — e.g. continuing after the crash/reboot this protocol
+# is designed to capture. phase0 and `all` always start a fresh dir.
+case "${1:-help}" in
+    phase0|all|help|--help|-h) ;;
+    *)
+        if [ -z "${FORENSIC_DIR:-}" ]; then
+            _latest_dir=$(ls -dt "${FORENSIC_BASE}-"* 2>/dev/null | head -1 || echo "")
+            if [ -n "$_latest_dir" ] && [ -d "$_latest_dir" ]; then
+                FORENSIC_DIR="$_latest_dir"
+                STATE_FILE="$FORENSIC_DIR/.state"
+                PHASE_FILE="$FORENSIC_DIR/.current_phase"
+                export FORENSIC_DIR
+            fi
+        fi
+        ;;
+esac
 
 case "${1:-help}" in
     all)        all ;;

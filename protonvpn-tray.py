@@ -22,7 +22,7 @@ import re as _re
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Notify", "0.7")
-from gi.repository import Gtk, GLib, Notify
+from gi.repository import Gtk, GLib, Notify, Gdk
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -105,10 +105,16 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
             elif _failure_count >= _MAX_FAILURES and not _polling_paused:
                 _polling_paused = True
             if proc is not None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
+                # Only signal a real child's process group: killpg(1) is
+                # kill(-1) — SIGKILL to every process the user can signal,
+                # i.e. the entire desktop session. A mocked/sentinel pid
+                # (MagicMock resolves to 1) must never reach the syscall.
+                # See docs/errors/2026-06/20260610-RCA-system-freeze-during-test-runs.md
+                if type(proc.pid) is int and proc.pid > 1:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
                     proc.wait(timeout=5)
                 except Exception:
@@ -126,10 +132,16 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
             if _failure_count >= _MAX_FAILURES and not _polling_paused:
                 _polling_paused = True
             if proc is not None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
+                # Only signal a real child's process group: killpg(1) is
+                # kill(-1) — SIGKILL to every process the user can signal,
+                # i.e. the entire desktop session. A mocked/sentinel pid
+                # (MagicMock resolves to 1) must never reach the syscall.
+                # See docs/errors/2026-06/20260610-RCA-system-freeze-during-test-runs.md
+                if type(proc.pid) is int and proc.pid > 1:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
                     proc.wait(timeout=5)
                 except Exception:
@@ -295,11 +307,29 @@ def _collect_network_details():
     return "\n\n".join(details)
 
 
-def _show_text_dialog(title, text, width=700, height=500):
+def _show_text_dialog(title, text, width=700, height=500, on_close=None):
     win = Gtk.Window(title=title, modal=True, default_width=width, default_height=height)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.set_keep_above(True)
     win.set_border_width(8)
+
+    # Make close terminal and idempotent: the Close button, the window-manager
+    # close (delete-event), and Esc all route through one handler that fires
+    # on_close exactly once, so the owner's "dialog active" state is always
+    # cleared. Without this the info dialog set its active-flag but never reset
+    # it on close — the menu item then silently refused to reopen.
+    _closed = {"done": False}
+
+    def _do_close(*_a):
+        if not _closed["done"]:
+            _closed["done"] = True
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:
+                    pass
+        win.destroy()
+        return False
 
     scrolled = Gtk.ScrolledWindow()
     scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -314,10 +344,14 @@ def _show_text_dialog(title, text, width=700, height=500):
     scrolled.add(label)
 
     btn = Gtk.Button(label="Close")
-    btn.connect("clicked", lambda _: win.destroy())
+    btn.connect("clicked", _do_close)
     btn.set_halign(Gtk.Align.CENTER)
     btn.set_margin_top(8)
     btn.set_margin_bottom(4)
+
+    win.connect("delete-event", _do_close)
+    win.connect("key-press-event", lambda _w, ev: _do_close()
+                if ev.keyval == Gdk.KEY_Escape else None)
 
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     vbox.pack_start(scrolled, True, True, 0)
@@ -792,13 +826,21 @@ class ProtonVPNTray:
         if self.busy or self._polling:
             return True
         now = _time.monotonic()
-        if self._last_poll_time > 0 and (now - self._last_poll_time) < POLL_MIN_INTERVAL:
+        # Treat both the 0 initial value and an unset/None as "never polled" so
+        # the first poll always proceeds; only throttle once we have a real
+        # prior timestamp (avoids `None > 0` TypeError aborting the poll loop).
+        if self._last_poll_time and (now - self._last_poll_time) < POLL_MIN_INTERVAL:
             return True
         self._polling = True
+        # Stamp at dispatch (poll START), not in the callback: the callback is
+        # async, so stamping there leaves _last_poll_time None/stale until the
+        # first CLI call returns — the rate limiter would never actually fire
+        # for rapid re-entry. Start-to-start spacing is what POLL_MIN_INTERVAL
+        # means ("minimum seconds between status polls").
+        self._last_poll_time = now
 
         def callback(ret, out, err):
             self._polling = False
-            self._last_poll_time = _time.monotonic()
             if self._quitting:
                 return
             state, info = parse_status(out)
@@ -1077,6 +1119,10 @@ class ProtonVPNTray:
 
         connection_status = self.connection_info
 
+        # Mark active BEFORE creating the window so a fast second click can't
+        # stack a duplicate dialog; the on_close handler clears it so the
+        # menu item works again next time (and never re-pops on its own).
+        self._info_dialog_active = True
         self._info_label = _show_text_dialog(
             "Proton VPN — Connection Info",
             (
@@ -1087,8 +1133,8 @@ class ProtonVPNTray:
                 + "═══ Network Diagnostics ═══\n"
                 + "Collecting network details..."
             ),
+            on_close=lambda: setattr(self, "_info_dialog_active", False),
         )
-        self._info_dialog_active = True
 
         def callback(ret, out, err):
             if self._quitting and not self._info_dialog_active:

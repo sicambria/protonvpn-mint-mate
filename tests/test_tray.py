@@ -494,17 +494,18 @@ with patch.object(MOD.subprocess, "run", side_effect=FileNotFoundError):
         check("spawn_xdotool_raise: suppresses FileNotFoundError",
               False, str(e))
 
-# 11.5 Thread is daemon
+# 11.5 Synchronous: wmctrl tried first; on success it returns without
+# falling through to xdotool (the old threaded spawn_xdotool_raise was
+# replaced by the synchronous _raise_window in f0ebd88).
 with patch.object(MOD.subprocess, "run") as mock_run:
-    with patch.object(MOD.threading, "Thread", wraps=MOD.threading.Thread) as mock_thread:
-        sxr("Daemon Test")
-        import time
-        time.sleep(0.05)
-        check("spawn_xdotool_raise: daemon=True passed",
-              any("daemon=True" in str(c) for c in mock_thread.call_args_list)
-              or any(True for _, kwargs in mock_thread.call_args_list
-                     if kwargs.get("daemon") is True),
-              "Not found in %s" % str(mock_thread.call_args_list))
+    sxr("Sync Test")
+    cmds = [c[0][0] for c in mock_run.call_args_list if c[0]]
+    check("spawn_xdotool_raise: wmctrl tried first",
+          bool(cmds) and cmds[0][0] == "wmctrl",
+          "first cmd was %s" % (cmds[0] if cmds else None))
+    check("spawn_xdotool_raise: returns after wmctrl success (no xdotool)",
+          all(cmd[0] != "xdotool" for cmd in cmds),
+          "xdotool called despite wmctrl success: %s" % cmds)
 
 # ===================================================================
 # 12. _collect_network_details
@@ -700,14 +701,20 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen:
     check("run_cli: error stderr", err == "error msg")
 
 # 15.3 Timeout
-with patch.object(MOD.subprocess, "Popen") as mock_popen:
+# os.killpg MUST be patched here: a bare MagicMock pid resolves to 1 via
+# __index__, and killpg(1, SIGKILL) == kill(-1, SIGKILL) — it SIGKILLs the
+# entire user session (caused the 2026-06-10 forced logoffs; see
+# docs/errors/2026-06/20260610-RCA-system-freeze-during-test-runs.md).
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
+     patch.object(MOD.os, "killpg") as mock_killpg:
     mock_proc = MagicMock()
+    mock_proc.pid = 4999999  # > kernel pid_max (4194304): can never exist
     mock_proc.communicate.side_effect = real_subprocess.TimeoutExpired("cmd", 5)
     mock_popen.return_value = mock_proc
     rc, out, err = MOD.run_cli(["status"])
     check("run_cli: timeout rc=-1", rc == -1)
     check("run_cli: timeout msg", "Command timed out" in err)
-    check("run_cli: timeout kills process", mock_proc.kill.called)
+    check("run_cli: timeout kills process group", mock_killpg.called)
 
 # 15.4 ProtonVPN binary not found
 with patch.object(MOD.subprocess, "Popen", side_effect=FileNotFoundError):
@@ -840,7 +847,7 @@ check("const: CONFIG_DIR", MOD.CONFIG_DIR == os.path.expanduser("~/.config/proto
 check("const: CMD_TIMEOUT_STATUS", MOD.CMD_TIMEOUT_STATUS == 5)
 check("const: CMD_TIMEOUT_CONNECT", MOD.CMD_TIMEOUT_CONNECT == 25)
 check("const: CMD_TIMEOUT_INFO", MOD.CMD_TIMEOUT_INFO == 15)
-check("const: CONFIG_CACHE_TTL", MOD.CONFIG_CACHE_TTL == 5)
+check("const: CONFIG_CACHE_TTL", MOD.CONFIG_CACHE_TTL == 15)
 
 # ===================================================================
 # 20. Module-level symbols
@@ -1103,7 +1110,7 @@ with patch.object(MOD, "run_cli") as mock_cli:
           "CLI was called despite fresh cache")
 
 # 24.2 Stale cache → CLI called
-t._config_cache_time = time.time() - 10  # older than TTL
+t._config_cache_time = time.time() - 20  # older than CONFIG_CACHE_TTL (15s)
 with patch.object(MOD, "run_cli") as mock_cli:
     mock_result = (0, "Setting              Value\n"
                     "netshield            off\n"
@@ -1444,19 +1451,21 @@ t.config["favorites"] = ["DE"]
 t.config["default_country"] = "CH"
 
 # 30.1 _on_default_country builds correct zenity args
-with patch.object(MOD.subprocess, "run") as mock_run, \
+# Handler spawns zenity via subprocess.Popen (NOT .run) — patching the wrong
+# one launches a real modal dialog. See helpers._install_gui_spawn_guard.
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "DE\n"
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("DE\n", "")
+    mock_popen.return_value = mock_proc
     MOD.ProtonVPNTray._on_default_country(t, None)
     check("I-args: _on_default_country called xdotool", mock_xd.called)
     # Find the zenity call (there may be subsequent CLI calls from _run_vpn_action)
-    zenity_calls = [c[0][0] for c in mock_run.call_args_list
+    zenity_calls = [c[0][0] for c in mock_popen.call_args_list
                     if len(c[0]) > 0 and "zenity" in c[0][0]]
     check("I-args: zenity call found", len(zenity_calls) >= 1,
-          "no zenity in %d calls" % len(mock_run.call_args_list))
+          "no zenity in %d calls" % len(mock_popen.call_args_list))
     if zenity_calls:
         za = zenity_calls[0]
         check("I-args: zenity --list --radiolist",
@@ -1487,7 +1496,7 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD.ProtonVPNTray, "_rebuild_all_submenus") as mock_rebuild:
     mock_proc = MagicMock()
     mock_proc.returncode = 0
-    mock_proc.stdout = "DE,FR\n"
+    mock_proc.communicate.return_value = ("DE,FR\n", "")
     mock_popen.return_value = mock_proc
     MOD.ProtonVPNTray._on_manage_favorites(t, None)
     check("I-args: favorites called raise_window", mock_raise.called)
@@ -1512,6 +1521,7 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD.ProtonVPNTray, "_rebuild_all_submenus") as mock_rebuild:
     mock_proc = MagicMock()
     mock_proc.returncode = 1  # cancel
+    mock_proc.communicate.return_value = ("", "")
     mock_popen.return_value = mock_proc
     saved_favs = list(t.config.get("favorites", []))
     MOD.ProtonVPNTray._on_manage_favorites(t, None)
@@ -1521,20 +1531,21 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
           "rebuild called on cancel — wasted work")
 
 # 30.5 _on_custom_dns builds correct zenity args
-with patch.object(MOD.subprocess, "run") as mock_run, \
+# Handler spawns zenity via subprocess.Popen (NOT .run).
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "1.1.1.1,8.8.8.8\n"
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("1.1.1.1,8.8.8.8\n", "")
+    mock_popen.return_value = mock_proc
     MOD.ProtonVPNTray._on_custom_dns(t, None)
     check("I-args: DNS called xdotool", mock_xd.called)
-    # Find the zenity call among all subprocess.run calls (xdotool runs first in thread)
-    zenity_calls = [c[0][0] for c in mock_run.call_args_list
+    # Find the zenity call among all subprocess.Popen calls (xdotool runs first in thread)
+    zenity_calls = [c[0][0] for c in mock_popen.call_args_list
                     if len(c[0]) > 0 and "zenity" in c[0][0]]
     check("I-args: zenity --entry",
           len(zenity_calls) >= 1 and "--entry" in zenity_calls[0],
-          "no zenity call found in %s" % str([c[0][0][:3] for c in mock_run.call_args_list]))
+          "no zenity call found in %s" % str([c[0][0][:3] for c in mock_popen.call_args_list]))
     if zenity_calls:
         check("I-args: title Custom DNS",
               "Custom DNS" in zenity_calls[0])
@@ -1853,12 +1864,14 @@ heading("37. INTEGRATION: Custom DNS edge paths")
 t = make_tray()
 
 # 37.1 Empty input → disable DNS
-with patch.object(MOD.subprocess, "run") as mock_run, \
+# Handlers spawn zenity via subprocess.Popen + proc.communicate(), so these
+# tests must mock Popen (not .run) or they launch real modal dialogs.
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "\n"  # empty input
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("\n", "")  # empty input
+    mock_popen.return_value = mock_proc
     with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
         MOD.ProtonVPNTray._on_custom_dns(t, None)
         check("I-dns-empty: action called", mock_action.called)
@@ -1868,34 +1881,35 @@ with patch.object(MOD.subprocess, "run") as mock_run, \
               "args: %s" % args)
 
 # 37.2 Cancel → return without action
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 1  # cancel
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 1  # cancel
+    mock_proc.communicate.return_value = ("", "")
+    mock_popen.return_value = mock_proc
     with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
         MOD.ProtonVPNTray._on_custom_dns(t, None)
         check("I-dns-cancel: no action on cancel", not mock_action.called)
 
 # 37.3 Non-empty but all whitespace → return without action
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "   ,   ,   \n"  # whitespace only
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("   ,   ,   \n", "")  # whitespace only
+    mock_popen.return_value = mock_proc
     with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
         MOD.ProtonVPNTray._on_custom_dns(t, None)
         check("I-dns-whitespace: no action for whitespace-only",
               not mock_action.called)
 
 # 37.4 Valid IPs but single → sets DNS
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "1.2.3.4\n"
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("1.2.3.4\n", "")
+    mock_popen.return_value = mock_proc
     with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
         MOD.ProtonVPNTray._on_custom_dns(t, None)
         check("I-dns-valid: action called", mock_action.called)
@@ -1904,7 +1918,7 @@ with patch.object(MOD.subprocess, "run") as mock_run, \
               "args: %s" % args)
 
 # 37.5 Exception in DNS flow
-with patch.object(MOD.subprocess, "run", side_effect=OSError("spawn failed")), \
+with patch.object(MOD.subprocess, "Popen", side_effect=OSError("spawn failed")), \
      patch.object(MOD, "_raise_window") as mock_xd:
     try:
         MOD.ProtonVPNTray._on_custom_dns(t, None)
@@ -1923,54 +1937,57 @@ t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany")]
 t.countries_loaded = True
 
 # 38.1 Default country canceled
-with patch.object(MOD.subprocess, "run") as mock_run, \
+# Handlers spawn zenity via subprocess.Popen — mock Popen, not .run.
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd, \
      patch.object(MOD, "notify") as mock_notify:
-    mock_result = MagicMock()
-    mock_result.returncode = 1  # cancel
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 1  # cancel
+    mock_proc.communicate.return_value = ("", "")
+    mock_popen.return_value = mock_proc
     saved = t.config.get("default_country", "")
     MOD.ProtonVPNTray._on_default_country(t, None)
     check("I-cancel: default country unchanged on cancel",
           t.config.get("default_country") == saved)
 
 # 38.2 Default country with empty selection
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "\n"  # empty
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = ("\n", "")  # empty
+    mock_popen.return_value = mock_proc
     saved = t.config.get("default_country", "")
     MOD.ProtonVPNTray._on_default_country(t, None)
     check("I-cancel: empty selection → config unchanged",
           t.config.get("default_country") == saved)
 
 # 38.3 Manage favorites canceled
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 1  # cancel
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 1  # cancel
+    mock_proc.communicate.return_value = ("", "")
+    mock_popen.return_value = mock_proc
     saved_favs = list(t.config.get("favorites", []))
     MOD.ProtonVPNTray._on_manage_favorites(t, None)
     check("I-cancel: favorites unchanged on cancel",
           t.config.get("favorites") == saved_favs)
 
 # 38.4 Manage favorites error (returncode > 1)
-with patch.object(MOD.subprocess, "run") as mock_run, \
+with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
-    mock_result = MagicMock()
-    mock_result.returncode = 2  # error
-    mock_result.stdout = ""
-    mock_run.return_value = mock_result
+    mock_proc = MagicMock()
+    mock_proc.returncode = 2  # error
+    mock_proc.communicate.return_value = ("", "")
+    mock_popen.return_value = mock_proc
     saved_favs = list(t.config.get("favorites", []))
     MOD.ProtonVPNTray._on_manage_favorites(t, None)
     check("I-cancel: favorites unchanged on error",
           t.config.get("favorites") == saved_favs)
 
 # 38.5 Exception in default country
-with patch.object(MOD.subprocess, "run", side_effect=OSError("fail")), \
+with patch.object(MOD.subprocess, "Popen", side_effect=OSError("fail")), \
      patch.object(MOD, "_raise_window") as mock_xd:
     try:
         MOD.ProtonVPNTray._on_default_country(t, None)
@@ -1979,7 +1996,7 @@ with patch.object(MOD.subprocess, "run", side_effect=OSError("fail")), \
         check("I-cancel: exception caught → no crash", False, str(e))
 
 # 38.6 Exception in manage favorites
-with patch.object(MOD.subprocess, "run", side_effect=OSError("fail")), \
+with patch.object(MOD.subprocess, "Popen", side_effect=OSError("fail")), \
      patch.object(MOD, "_raise_window") as mock_xd:
     try:
         MOD.ProtonVPNTray._on_manage_favorites(t, None)
