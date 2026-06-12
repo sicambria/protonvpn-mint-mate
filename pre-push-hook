@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# pre-push hook — runs the full test suite before pushing
+# Part of protonvpn-mint-mate
+#
+# Skip:   SKIP_TESTS=1 git push
+#         git push --no-verify
+
+set -euo pipefail
+
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+if [ ! -x "$REPO_ROOT/run-tests.sh" ]; then
+	exit 0
+fi
+
+echo ""
+
+if ! "$REPO_ROOT/run-tests.sh"; then
+	printf "  ${RED}${BOLD}✖  BLOCKED — test suite failed.${NC}\n"
+	printf "  %-4s SKIP_TESTS=1 git push  (bypass in emergencies only)\n" ""
+	echo ""
+	exit 1
+fi
+
+echo "  ✓  test suite: OK"
+echo ""
+exit 0

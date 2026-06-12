@@ -42,6 +42,10 @@ All test files mock `subprocess.Popen` — no real `protonvpn` binary is ever ca
 
 CI (`.github/workflows/ci.yml`): runs coverage session, shell script tests, GTK tests under `xvfb-run`, generates HTML report.
 
+## Git Hooks
+
+`install.sh` installs `pre-commit-hook` → `.git/hooks/pre-commit` and `pre-push-hook` → `.git/hooks/pre-push`. Both call `run-tests.sh` (coverage session + `tests/test_shell_scripts.py`, ~1m15s) — pre-commit also runs the secrets/fingerprint scanner first. Bypass: `SKIP_TESTS=1 git commit|push ...` (tests) or `SKIP_SECRET_SCAN=1 git commit ...` / `git commit|push --no-verify` (everything). Same tray-not-running precondition applies.
+
 ## Architecture
 
 - **Entrypoint**: `ProtonVPNTray.__init__()` at line 347

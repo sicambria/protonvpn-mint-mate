@@ -84,14 +84,18 @@ chmod +x "$SCRIPT_DIR/enable-autostart.sh"
 chmod +x "$SCRIPT_DIR/disable-autostart.sh"
 chmod +x "$SCRIPT_DIR/install.sh"
 chmod +x "$SCRIPT_DIR/pre-commit-hook"
+chmod +x "$SCRIPT_DIR/pre-push-hook"
+chmod +x "$SCRIPT_DIR/run-tests.sh"
 
 # Clear stale bytecode cache so source edits take effect immediately
 find "$SCRIPT_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
-# --- 5. Install pre-commit hook ---
-echo "[5/7] Installing pre-commit secrets scanner..."
+# --- 5. Install pre-commit and pre-push hooks ---
+echo "[5/7] Installing pre-commit/pre-push hooks (secrets scan + full test suite)..."
 cp "$SCRIPT_DIR/pre-commit-hook" "$SCRIPT_DIR/.git/hooks/pre-commit"
-echo "  Pre-commit secrets scanner installed."
+cp "$SCRIPT_DIR/pre-push-hook" "$SCRIPT_DIR/.git/hooks/pre-push"
+chmod +x "$SCRIPT_DIR/.git/hooks/pre-commit" "$SCRIPT_DIR/.git/hooks/pre-push"
+echo "  Pre-commit (secrets scan + tests) and pre-push (tests) hooks installed."
 
 # --- 6. Enable autostart ---
 echo "[6/7] Enabling auto-start on login..."
