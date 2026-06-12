@@ -1275,6 +1275,7 @@ class ProtonVPNTray:
         dlg = Gtk.AboutDialog()
         dlg.set_program_name("Proton VPN Tray")
         dlg.set_title("About Proton VPN Tray")
+        dlg.set_logo_icon_name("network-vpn")
         dlg.set_comments(
             "System tray application for managing Proton VPN "
             "connections on Linux Mint MATE.\n"

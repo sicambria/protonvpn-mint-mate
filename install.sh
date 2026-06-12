@@ -9,7 +9,8 @@
 #   4. Makes scripts executable
 #   5. Installs pre-commit secrets scanner hook
 #   6. Enables auto-start on login
-#   7. Verifies Proton VPN sign-in status
+#   7. Creates a start menu entry to launch the tray
+#   8. Verifies Proton VPN sign-in status
 
 set -euo pipefail
 
@@ -22,7 +23,7 @@ echo "============================================"
 echo ""
 
 # --- 1. System dependencies ---
-echo "[1/6] Installing system dependencies..."
+echo "[1/7] Installing system dependencies..."
 
 PACKAGES="python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 zenity"
 
@@ -42,7 +43,7 @@ else
 fi
 
 # --- 2. Proton VPN CLI ---
-echo "[2/6] Verifying Proton VPN CLI..."
+echo "[2/7] Verifying Proton VPN CLI..."
 
 if ! command -v protonvpn &>/dev/null; then
     echo "  Proton VPN CLI not found. Installing..."
@@ -64,7 +65,7 @@ else
 fi
 
 # --- 3. Config directory ---
-echo "[3/6] Setting up configuration..."
+echo "[3/7] Setting up configuration..."
 
 mkdir -p "$CONFIG_DIR"
 
@@ -76,7 +77,7 @@ else
 fi
 
 # --- 4. Make scripts executable ---
-echo "[4/6] Setting executable permissions..."
+echo "[4/7] Setting executable permissions..."
 
 chmod +x "$SCRIPT_DIR/protonvpn-tray.py"
 chmod +x "$SCRIPT_DIR/enable-autostart.sh"
@@ -88,14 +89,32 @@ chmod +x "$SCRIPT_DIR/pre-commit-hook"
 find "$SCRIPT_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
 # --- 5. Install pre-commit hook ---
-echo "[5/6] Installing pre-commit secrets scanner..."
+echo "[5/7] Installing pre-commit secrets scanner..."
 cp "$SCRIPT_DIR/pre-commit-hook" "$SCRIPT_DIR/.git/hooks/pre-commit"
 echo "  Pre-commit secrets scanner installed."
 
 # --- 6. Enable autostart ---
-echo "[6/6] Enabling auto-start on login..."
+echo "[6/7] Enabling auto-start on login..."
 
 "$SCRIPT_DIR/enable-autostart.sh"
+
+# --- 7. Application menu entry ---
+echo "[7/7] Creating start menu entry..."
+
+APPLICATIONS_DIR="$HOME/.local/share/applications"
+MENU_ENTRY="$APPLICATIONS_DIR/protonvpn-tray.desktop"
+
+mkdir -p "$APPLICATIONS_DIR"
+sed -e "s|^Exec=.*|Exec=python3 $SCRIPT_DIR/protonvpn-tray.py|" \
+    -e "/^X-GNOME-Autostart-enabled=/d" \
+    "$SCRIPT_DIR/protonvpn-tray.desktop" > "$MENU_ENTRY"
+
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
+
+echo "  Menu entry created at $MENU_ENTRY"
+echo "  (the tray script exits quietly if it is already running)"
 
 echo ""
 echo "============================================"
@@ -104,6 +123,7 @@ echo "============================================"
 echo ""
 echo " Configuration: $CONFIG_DIR/config.json"
 echo " Autostart:    $HOME/.config/autostart/protonvpn-tray.desktop"
+echo " Menu entry:   $MENU_ENTRY"
 echo ""
 echo " To start the tray now:"
 echo "   python3 $SCRIPT_DIR/protonvpn-tray.py"
