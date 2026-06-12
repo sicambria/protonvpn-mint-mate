@@ -45,7 +45,8 @@ CI (`.github/workflows/ci.yml`): runs coverage session, shell script tests, GTK 
 ## Architecture
 
 - **Entrypoint**: `ProtonVPNTray.__init__()` at line 347
-- **Poll timer**: `GLib.timeout_add_seconds(5, self._poll_status)` at line 382 — permanent recurring timer. Calls `run_cli_async(["status"], 5, callback)` which spawns a daemon thread per tick.
+- **Poll timer**: `GLib.timeout_add_seconds(POLL_INTERVAL, self._poll_status)` — permanent recurring timer (`POLL_INTERVAL=20`). Calls `run_cli_async(["status"], 5, callback)` which spawns a daemon thread per tick. **Adaptive backoff**: a timer-driven poll only actually spawns the (expensive, ~1.5 CPU-s) CLI child once `self._poll_backoff` has elapsed; the window grows by `POLL_INTERVAL` toward `POLL_INTERVAL_MAX=60` while connection state is unchanged and resets to `POLL_INTERVAL` on any state change or user action. `_poll_status(force=True)` (via `_poll_now`) bypasses the window for immediate post-action refresh.
+- **`_poll_now` (one-shot)**: post-action/refresh code uses `GLib.idle_add(self._poll_now)`, NOT `idle_add(self._poll_status)`. `_poll_status` returns `True` (G_SOURCE_CONTINUE) for its recurring timer; passing it to `idle_add` leaks a permanent idle source that re-fires every main-loop iteration = **100% CPU spin**. `_poll_now` forces a poll and returns `False`. `run_cli_async`'s idle dispatch likewise always returns `False`. See `docs/errors/2026-06/20260612-RCA-idle-source-spin-and-poll-cost.md`.
 - **Circuit breaker** (lines 60–64, module-level globals): `_failure_count`, `_consecutive_timeouts`, `_polling_paused`. After 10 failures or 3 consecutive timeouts, polling pauses.
 - **Serial lock**: `_cli_lock` (line 65) — all CLI calls serialized. A single hung `status` blocks connect/disconnect/config.
 - **Config**: `~/.config/protonvpn-tray/config.json` — `{"default_country", "auto_connect_on_start", "favorites", "last_connected"}`.
@@ -56,7 +57,7 @@ CI (`.github/workflows/ci.yml`): runs coverage session, shell script tests, GTK 
 
 ## Known Gotchas
 
-- **Poll hangs = 98% CPU**: If `protonvpn status` hangs, every 5s a new subprocess spawns. Circuit breaker only catches *timeouts/crashes*, not CPU-spinning CLI processes. If you see this, check `/proc/<tray_pid>/stack` and `coredumpctl list`.
+- **Poll hangs = 98% CPU**: If `protonvpn status` hangs, every `POLL_INTERVAL`s (20s) a new subprocess spawns. Circuit breaker only catches *timeouts/crashes*, not CPU-spinning CLI processes. If you see this, check `/proc/<tray_pid>/stack` and `coredumpctl list`.
 - **Stale `.pyc`**: After `git pull` or editing, `__pycache__/` may contain old bytecode. Always `rm -rf __pycache__/` before testing.
 - **Zenity blocks shutdown**: If a zenity dialog is open when SIGTERM arrives, shutdown delays until it closes.
 - **`notify()` is a no-op until `Notify.init()`**: `_notify_initialized` flag guards it — `notify()` called before `__init__` completes does nothing.
@@ -72,7 +73,7 @@ CI (`.github/workflows/ci.yml`): runs coverage session, shell script tests, GTK 
 | `parse_status/countries/config_list` | 172–239 | CLI output parsers |
 | `notify()` | 244–252 | libnotify (guarded by `_notify_initialized`) |
 | `ProtonVPNTray.__init__` | 347–389 | PID check, indicator, menu, poll timer, auto-connect, signal handlers |
-| `_poll_status()` | 781–855 | 5s timer callback — rate-limited, guarded by `_polling` flag + circuit breaker |
+| `_poll_status()` | 781–855 | 20s timer callback — rate-limited, guarded by `_polling` flag + circuit breaker |
 | Connection handlers | 898–970 | Fastest/Secure Core/Tor/P2P connect, disconnect |
 | `_on_quit()` / `_shutdown()` | 1207–1212, 439–448 | Clean shutdown — `_quitting=True`, PID removal, Notify.uninit, Gtk.main_quit |
 

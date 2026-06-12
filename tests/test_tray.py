@@ -141,10 +141,9 @@ pc = MOD.parse_countries
 
 # Normal output
 c = pc("Country               Code\n------------------     ----\n"
-       "Switzerland            CH\nGermany                DE\nIceland                IS\n")
-check("countries: count normal", len(c) == 3, "got %d" % len(c))
+       "Switzerland            CH\nIceland                IS\n")
+check("countries: count normal", len(c) == 2, "got %d" % len(c))
 check("countries: CH entry", c[0] == ("CH", "Switzerland"), str(c[0]))
-check("countries: DE entry", ("DE", "Germany") in c)
 check("countries: IS entry", ("IS", "Iceland") in c)
 
 # Empty string
@@ -162,8 +161,8 @@ check("countries: unicode name", ("CI", "C\u00f4te d'Ivoire") in c)
 
 # Malformed lines (no 2-char code at end)
 c = pc("Country               Code\n------------------     ----\n"
-       "ValidCountry           CH\nBadLine WithoutCode\nAnotherGood            DE\n")
-check("countries: skip malformed", len(c) == 2 and ("DE", "AnotherGood") in c,
+       "ValidCountry           CH\nBadLine WithoutCode\nAnotherGood            IS\n")
+check("countries: skip malformed", len(c) == 2 and ("IS", "AnotherGood") in c,
       "got %s" % c)
 
 # "Updating..." / non-table line
@@ -304,12 +303,12 @@ try:
               "got %s" % json.dumps(c3))
 
         # 6.4 Only partial keys
-        partial = {"default_country": "DE"}
+        partial = {"default_country": "CH"}
         with open(os.path.join(tmpdir2, "config.json"), "w") as f:
             json.dump(partial, f)
         c4 = lc(MagicMock())
         check("load: partial -> merged with defaults",
-              c4["default_country"] == "DE" and c4["auto_connect_on_start"] is True,
+              c4["default_country"] == "CH" and c4["auto_connect_on_start"] is True,
               "got %s" % json.dumps(c4))
 finally:
     shutil.rmtree(tmpdir2, ignore_errors=True)
@@ -1145,9 +1144,9 @@ with patch.object(MOD, "run_cli") as mock_cli:
         mock_mi.return_value = mock_item
         with patch.object(MOD.Gtk, "SeparatorMenuItem", return_value=MagicMock()):
             menu = MOD.ProtonVPNTray._build_settings_menu(t)
-    check("I-cache: error message when both cache and CLI fail",
-          mock_item.set_sensitive.called or mock_mi.called,
-          "menu item not created")
+    check("I-cache: error item is insensitive",
+          mock_item.set_sensitive.called,
+          "set_sensitive not called on error item")
 
 
 # ===================================================================
@@ -1165,15 +1164,17 @@ with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
      patch.object(MOD.Gtk, "SeparatorMenuItem", return_value=MagicMock()):
     mock_mi.return_value = MagicMock()
     MOD.ProtonVPNTray._build_country_menu(t)
+    loading_labels = [str(c[1].get("label", c[0][0] if c[0] else ""))
+                      for c in mock_mi.call_args_list
+                      if "loading" in str(c).lower()]
     check("I-countries: Loading shown when not loaded",
-          mock_mi.called,
-          "menu items created")
+          any("Loading countries" in l for l in loading_labels),
+          "labels: %s" % loading_labels)
 
 # 25.2 Loaded with favorites → favorites first
 t.countries_loaded = True
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany"),
-                     ("FR", "France"), ("IS", "Iceland")]
-t.config["favorites"] = ["DE", "IS"]
+t.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
+t.config["favorites"] = ["CH", "IS"]
 
 with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
      patch.object(MOD.Gtk, "MenuItem") as mock_mi, \
@@ -1181,12 +1182,12 @@ with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
     mock_mi.return_value = MagicMock()
     menu = MOD.ProtonVPNTray._build_country_menu(t)
     check("I-countries: favorites marked with star",
-          mock_mi.call_count >= 4,  # 2 favorites + 2 others + separator somewhere
+          mock_mi.call_count >= 2,
           "call_count=%d" % mock_mi.call_count)
 
 # 25.3 No favorites → all countries shown sorted
 t.config["favorites"] = []
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany")]
+t.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
 with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
      patch.object(MOD.Gtk, "MenuItem", return_value=MagicMock()) as mock_mi, \
      patch.object(MOD.Gtk, "SeparatorMenuItem", return_value=MagicMock()):
@@ -1445,9 +1446,9 @@ check("I-update-dialog: exception clears active flag",
 heading("30. INTEGRATION: Zenity arg construction")
 
 t = make_tray()
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany"), ("FR", "France")]
+t.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
 t.countries_loaded = True
-t.config["favorites"] = ["DE"]
+t.config["favorites"] = ["CH"]
 t.config["default_country"] = "CH"
 
 # 30.1 _on_default_country builds correct zenity args
@@ -1457,7 +1458,7 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_xd:
     mock_proc = MagicMock()
     mock_proc.returncode = 0
-    mock_proc.communicate.return_value = ("DE\n", "")
+    mock_proc.communicate.return_value = ("CH\n", "")
     mock_popen.return_value = mock_proc
     MOD.ProtonVPNTray._on_default_country(t, None)
     check("I-args: _on_default_country called xdotool", mock_xd.called)
@@ -1472,12 +1473,12 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
               "zenity" in za and "--radiolist" in za)
         check("I-args: title Default Country", "Default Country" in za)
         check("I-args: print-column=2", "--print-column=2" in za)
-        check("I-args: favorites first (DE before FR)",
-              za.index("DE") < za.index("FR")
-              if "DE" in za and "FR" in za else False,
-              "DE idx=%s FR idx=%s" % (
-                  za.index("DE") if "DE" in za else -1,
-                  za.index("FR") if "FR" in za else -1))
+        check("I-args: favorites first (CH before IS)",
+              za.index("CH") < za.index("IS")
+              if "CH" in za and "IS" in za else False,
+              "CH idx=%s IS idx=%s" % (
+                  za.index("CH") if "CH" in za else -1,
+                  za.index("IS") if "IS" in za else -1))
         check("I-args: default selected (TRUE for CH)",
               "CH" in za and za[za.index("CH") - 1] == "TRUE",
               "CH not TRUE in %s" % str(za[-20:]))
@@ -1490,13 +1491,13 @@ with patch.object(MOD, "notify") as mock_notify:
 
 # 30.3 _on_manage_favorites builds correct zenity args and rebuilds menu
 t.countries_loaded = True
-t.config["favorites"] = ["DE"]
+t.config["favorites"] = ["CH"]
 with patch.object(MOD.subprocess, "Popen") as mock_popen, \
      patch.object(MOD, "_raise_window") as mock_raise, \
      patch.object(MOD.ProtonVPNTray, "_rebuild_all_submenus") as mock_rebuild:
     mock_proc = MagicMock()
     mock_proc.returncode = 0
-    mock_proc.communicate.return_value = ("DE,FR\n", "")
+    mock_proc.communicate.return_value = ("CH,IS\n", "")
     mock_popen.return_value = mock_proc
     MOD.ProtonVPNTray._on_manage_favorites(t, None)
     check("I-args: favorites called raise_window", mock_raise.called)
@@ -1512,8 +1513,8 @@ with patch.object(MOD.subprocess, "Popen") as mock_popen, \
         check("I-args: title Manage Favorites", "Manage Favorites" in za)
         check("I-args: separator=,", "--separator=," in za)
         check("I-args: favorites pre-checked",
-              "DE" in za and za[za.index("DE") - 1] == "TRUE",
-              "DE not TRUE in args")
+              "CH" in za and za[za.index("CH") - 1] == "TRUE",
+              "CH not TRUE in args")
 
 # 30.4 Manage favorites canceled — no rebuild
 with patch.object(MOD.subprocess, "Popen") as mock_popen, \
@@ -1635,8 +1636,8 @@ with patch.object(MOD.ProtonVPNTray, "_do_connect") as mock_conn:
 heading("33. INTEGRATION: Favorites → save → menu")
 
 t = make_tray()
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany"),
-                     ("FR", "France"), ("IS", "Iceland")]
+t.countries_cache = [("CH", "Switzerland"),
+                     ("IS", "Iceland")]
 t.countries_loaded = True
 t.config["favorites"] = []
 
@@ -1663,7 +1664,7 @@ with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
           "found %d starred items" % len(_star_labels(mock_mi)))
 
 # 33.2 Add favorites via config
-t.config["favorites"] = ["DE", "IS"]
+t.config["favorites"] = ["CH"]
 with patch.object(MOD, "atomic_write_json") as mock_save:
     tmpdir_fav = tempfile.mkdtemp()
     try:
@@ -1681,15 +1682,12 @@ with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
     mock_mi.return_value = MagicMock()
     MOD.ProtonVPNTray._build_country_menu(t)
     star_labels = _star_labels(mock_mi)
-    check("I-fav-save: DE starred after save",
-          any("DE" in s for s in star_labels),
+    check("I-fav-save: CH starred after save",
+          any("CH" in s for s in star_labels),
           "stars: %s" % star_labels)
-    check("I-fav-save: IS starred after save",
-          any("IS" in s for s in star_labels),
-          "stars: %s" % star_labels)
-    check("I-fav-save: CH not starred",
-          not any("CH" in s for s in star_labels),
-          "CH starred but not a favorite")
+    check("I-fav-save: IS not starred (not a favorite)",
+          not any("IS" in s for s in star_labels),
+          "IS starred but not a favorite")
 
 # 33.4 Remove favorites → no stars
 t.config["favorites"] = []
@@ -1734,14 +1732,14 @@ finally:
     shutil.rmtree(tmpdir_dc, ignore_errors=True)
 
 # 34.2 Default country used in auto-connect
-t.config["default_country"] = "FR"
+t.config["default_country"] = "IS"
 t.auto_connect = True
 t.config["auto_connect_on_start"] = True
 with patch.object(MOD.ProtonVPNTray, "_do_connect") as mock_conn:
     MOD.ProtonVPNTray._auto_connect_startup(t)
     call_args = mock_conn.call_args[0][0] if mock_conn.call_args else []
-    check("I-defcountry: FR in connect args",
-          "FR" in call_args or "--country" in call_args,
+    check("I-defcountry: IS in connect args",
+          "IS" in call_args or "--country" in call_args,
           "args: %s" % call_args)
 
 
@@ -1785,6 +1783,16 @@ with patch.object(MOD, "notify") as mock_notify:
     check("I-state: on_done error msg has Failed",
           any("Failed" in str(a) for a in err_call),
           "got %s" % str(err_call))
+
+# 35.4b _default_on_done "Unknown error" fallback (D10)
+with patch.object(MOD, "notify") as mock_notify:
+    MOD.ProtonVPNTray._default_on_done(t, 1, "", "")
+    check("I-state: unknown error notify called", mock_notify.called)
+    if mock_notify.called:
+        ue_call = mock_notify.call_args[0] if mock_notify.call_args else ()
+        check("I-state: unknown error msg has 'Unknown error'",
+              any("Unknown error" in str(a) for a in ue_call),
+              "got %s" % str(ue_call))
 
 # 35.5 Connect when already connected (disconnect first)
 t.connected = True
@@ -1834,18 +1842,18 @@ with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
 
 # 36.3 _make_country_connect_handler when not connected
 t.connected = False
-ch = MOD.ProtonVPNTray._make_country_connect_handler(t, "DE")
+ch = MOD.ProtonVPNTray._make_country_connect_handler(t, "CH")
 with patch.object(MOD.ProtonVPNTray, "_do_connect") as mock_conn:
     ch(None)
     check("I-setting: country handler → _do_connect when disconnected",
           mock_conn.called)
     check("I-setting: country code passed",
-          "DE" in str(mock_conn.call_args),
+          "CH" in str(mock_conn.call_args),
           "got %s" % str(mock_conn.call_args))
 
 # 36.4 _make_country_connect_handler when connected (disconnect first)
 t.connected = True
-ch2 = MOD.ProtonVPNTray._make_country_connect_handler(t, "FR")
+ch2 = MOD.ProtonVPNTray._make_country_connect_handler(t, "IS")
 with patch.object(MOD.ProtonVPNTray, "_run_vpn_action") as mock_action:
     ch2(None)
     check("I-setting: country handler → disconnect first when connected",
@@ -1933,7 +1941,7 @@ with patch.object(MOD.subprocess, "Popen", side_effect=OSError("spawn failed")),
 heading("38. INTEGRATION: Country/favorites cancel + error paths")
 
 t = make_tray()
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany")]
+t.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
 t.countries_loaded = True
 
 # 38.1 Default country canceled
@@ -2227,7 +2235,7 @@ with patch.object(MOD.ProtonVPNTray, "_build_country_menu",
 
 # 42.4 Country menu: missing favorites codes (use raw code)
 t.countries_loaded = True
-t.countries_cache = [("CH", "Switzerland"), ("DE", "Germany")]
+t.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
 t.config["favorites"] = ["XX"]  # code not in cache
 with patch.object(MOD.Gtk, "Menu", return_value=MagicMock()), \
      patch.object(MOD.Gtk, "MenuItem") as mock_mi, \

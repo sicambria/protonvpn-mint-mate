@@ -54,7 +54,9 @@ CMD_TIMEOUT_CONFIG = 8
 CMD_TIMEOUT_INFO = 15
 CMD_TIMEOUT_CONFIG_SET = 8
 CONFIG_CACHE_TTL = 15
-POLL_MIN_INTERVAL = 4          # minimum seconds between status polls
+POLL_INTERVAL = 20             # base seconds between recurring status polls
+POLL_INTERVAL_MAX = 60         # max poll spacing when connection state is stable
+POLL_MIN_INTERVAL = 4          # minimum seconds between status polls (anti-hammer)
 _MAX_CONSECUTIVE_TIMEOUTS = 3  # consecutive timeouts before breaker trip
 
 _MAX_FAILURES = 10
@@ -121,7 +123,7 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
                     pass
             log.warning("protonvpn %s timed out after %ds (failure #%d)",
                         " ".join(args), timeout, _failure_count)
-            return -1, "", "Command timed out"
+            return -1, "", "Command timed out: %s (%ds)" % (" ".join(args), timeout)
         except FileNotFoundError:
             _failure_count += 1
             if _failure_count >= _MAX_FAILURES and not _polling_paused:
@@ -147,13 +149,20 @@ def run_cli(args, timeout=CMD_TIMEOUT_STATUS):
                 except Exception:
                     pass
             log.warning("protonvpn %s error: %s", " ".join(args), e)
-            return -3, "", str(e)
+            return -3, "", "%s: %s" % (" ".join(args), e)
 
 
 def run_cli_async(args, timeout, callback):
     def target():
         ret, out, err = run_cli(args, timeout)
-        GLib.idle_add(lambda: callback(ret, out, err))
+
+        def dispatch():
+            callback(ret, out, err)
+            # Always return False: an idle source that returns True (because a
+            # callback happened to) is never removed and re-fires every main-loop
+            # iteration, pinning a core at 100%. This must be one-shot.
+            return False
+        GLib.idle_add(dispatch)
     t = threading.Thread(target=target, daemon=True)
     t.start()
 
@@ -401,6 +410,11 @@ class ProtonVPNTray:
         self._config_cache = {}
         self._config_cache_time = 0
         self._last_poll_time = 0
+        # Adaptive poll spacing: starts at POLL_INTERVAL and grows toward
+        # POLL_INTERVAL_MAX while the connection state is unchanged, so an idle
+        # tray spawns the (expensive, ~1.5 CPU-s) `protonvpn status` child far
+        # less often. Reset to POLL_INTERVAL on any state change or user action.
+        self._poll_backoff = POLL_INTERVAL
 
         self._check_pid()
         self._write_pid()
@@ -413,7 +427,7 @@ class ProtonVPNTray:
         self.menu = self._build_menu()
         self.indicator.set_menu(self.menu)
 
-        GLib.timeout_add_seconds(5, self._poll_status)
+        GLib.timeout_add_seconds(POLL_INTERVAL, self._poll_status)
         GLib.timeout_add(500, self._load_countries_async)
 
         if self.auto_connect and self.config.get("auto_connect_on_start", True):
@@ -812,7 +826,18 @@ class ProtonVPNTray:
         except Exception as e:
             log.warning("zenity custom DNS failed: %s", e)
 
-    def _poll_status(self):
+    def _poll_now(self):
+        """One-shot forced poll for GLib.idle_add (returns False so the idle
+        source is removed after a single dispatch). Bare GLib.idle_add(
+        self._poll_status) leaks a permanent idle source because _poll_status
+        returns True (G_SOURCE_CONTINUE) for its recurring timer — that source
+        then re-fires on every main-loop iteration and pins a core at 100%.
+        See docs/errors/2026-06/20260612-RCA-idle-source-spin-and-poll-cost.md
+        """
+        self._poll_status(force=True)
+        return False
+
+    def _poll_status(self, force=False):
         global _polling_paused_notified
         if _polling_paused:
             if not _polling_paused_notified:
@@ -830,6 +855,14 @@ class ProtonVPNTray:
         # the first poll always proceeds; only throttle once we have a real
         # prior timestamp (avoids `None > 0` TypeError aborting the poll loop).
         if self._last_poll_time and (now - self._last_poll_time) < POLL_MIN_INTERVAL:
+            return True
+        # Adaptive backoff: the recurring timer fires every POLL_INTERVAL, but a
+        # timer-driven poll only spawns the expensive CLI child once the current
+        # backoff window has elapsed. A forced poll (user action / refresh) skips
+        # the window and resets the backoff so the UI reflects the change at once.
+        if force:
+            self._poll_backoff = POLL_INTERVAL
+        elif self._last_poll_time and (now - self._last_poll_time) < self._poll_backoff:
             return True
         self._polling = True
         # Stamp at dispatch (poll START), not in the callback: the callback is
@@ -897,6 +930,16 @@ class ProtonVPNTray:
             elif not self.connected and old_connected and self.signed_in:
                 notify("Proton VPN", "Disconnected from VPN")
 
+            # Grow the poll window while nothing changes; snap back to the base
+            # interval the moment connection/sign-in state flips so transitions
+            # stay responsive. A stable idle tray settles at POLL_INTERVAL_MAX.
+            if self.connected != old_connected or self.signed_in != old_signed_in:
+                self._poll_backoff = POLL_INTERVAL
+            else:
+                self._poll_backoff = min(
+                    self._poll_backoff + POLL_INTERVAL, POLL_INTERVAL_MAX
+                )
+
         run_cli_async(["status"], CMD_TIMEOUT_STATUS, callback)
         return True
 
@@ -953,7 +996,7 @@ class ProtonVPNTray:
             self.busy = False
             if self._quitting:
                 return
-            GLib.idle_add(self._poll_status)
+            GLib.idle_add(self._poll_now)
             if on_done:
                 on_done(ret, out, err)
         run_cli_async(args, timeout, callback)
@@ -1123,18 +1166,22 @@ class ProtonVPNTray:
         # stack a duplicate dialog; the on_close handler clears it so the
         # menu item works again next time (and never re-pops on its own).
         self._info_dialog_active = True
-        self._info_label = _show_text_dialog(
-            "Proton VPN — Connection Info",
-            (
-                "═══ VPN Connection ═══\n"
-                + (connection_status or self.status_raw or "Unknown")
-                + "\n\n═══ Proton VPN Account ═══\n"
-                + "Collecting info — please wait...\n\n"
-                + "═══ Network Diagnostics ═══\n"
-                + "Collecting network details..."
-            ),
-            on_close=lambda: setattr(self, "_info_dialog_active", False),
-        )
+        try:
+            self._info_label = _show_text_dialog(
+                "Proton VPN — Connection Info",
+                (
+                    "═══ VPN Connection ═══\n"
+                    + (connection_status or self.status_raw or "Unknown")
+                    + "\n\n═══ Proton VPN Account ═══\n"
+                    + "Collecting info — please wait...\n\n"
+                    + "═══ Network Diagnostics ═══\n"
+                    + "Collecting network details..."
+                ),
+                on_close=lambda: setattr(self, "_info_dialog_active", False),
+            )
+        except Exception:
+            self._info_dialog_active = False
+            return
 
         def callback(ret, out, err):
             if self._quitting and not self._info_dialog_active:
@@ -1220,7 +1267,7 @@ class ProtonVPNTray:
         self.countries_cache = []
         self._config_cache = {}
         self._config_cache_time = 0
-        GLib.idle_add(self._poll_status)
+        GLib.idle_add(self._poll_now)
         GLib.timeout_add(500, self._load_countries_async)
         notify("Proton VPN", "Refreshing...")
 

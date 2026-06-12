@@ -1,0 +1,10 @@
+# launched tray pid=550329 args=[], measuring 65s
+  +  10s  window CPU =   0.0% (one core)
+  +  20s  window CPU =  16.5% (one core)
+  +  30s  window CPU =   0.0% (one core)
+  +  40s  window CPU =  14.4% (one core)
+  +  50s  window CPU =   0.0% (one core)
+  +  60s  window CPU =   0.0% (one core)
+  +  70s  window CPU =   0.0% (one core)
+SUMMARY avg_cpu_pct_one_core=4.4 over 70s  samples=[0.0, 16.5, 0.0, 14.4, 0.0, 0.0, 0.0]
+# tray stopped

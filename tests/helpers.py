@@ -137,5 +137,6 @@ def make_tray(MOD):
     tray._config_cache = {}
     tray._config_cache_time = 0
     tray._last_poll_time = 0
+    tray._poll_backoff = MOD.POLL_INTERVAL
     tray._status_icon = None
     return tray

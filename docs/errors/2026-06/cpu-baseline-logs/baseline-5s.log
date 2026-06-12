@@ -1,0 +1,16 @@
+# poll-cost measurement: BASELINE-old-5s-poll
+# interval=5s duration=60s bin=/home/USER/.local/bin/protonvpn
+# call wall_s   cpu_s    rc   timed_out
+  1    2.179    1.577    -6   False
+  2    1.599    1.567    0    False
+  3    1.424    1.394    0    False
+  4    1.523    1.494    0    False
+  5    1.636    1.603    1    False
+  6    1.437    1.421    1    False
+  7    1.386    1.361    0    False
+  8    1.219    1.201    1    False
+  9    1.214    1.195    1    False
+  10   1.319    1.297    1    False
+  11   1.911    1.288    -6   False
+  12   1.222    1.204    0    False
+SUMMARY {"label": "BASELINE-old-5s-poll", "interval_s": 5.0, "duration_s": 60.0, "num_calls": 12, "total_child_cpu_s": 16.6, "avg_cpu_per_call_s": 1.383, "avg_wall_per_call_s": 1.506, "sustained_cpu_pct_one_core": 27.7, "timeouts": 0, "nonzero_rc": 7}

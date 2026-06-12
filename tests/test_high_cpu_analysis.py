@@ -300,16 +300,19 @@ with patch.object(MOD, "run_cli_async") as mock_async:
     check("6.2: second poll skipped within min interval",
           not mock_async.called)
 
-# 6.3 Poll after sufficient delay proceeds
-orig_sleep = time.sleep
-time.sleep(MOD.POLL_MIN_INTERVAL + 0.1)
+# 6.3 Forced poll proceeds once the min-interval has elapsed (no real sleep:
+# rewind _last_poll_time so just over POLL_MIN_INTERVAL has passed). A forced
+# poll bypasses the larger adaptive backoff window but still honours the
+# anti-hammer min interval.
 t3._polling = False
+t3._last_poll_time = MOD._time.monotonic() - (MOD.POLL_MIN_INTERVAL + 0.1)
+before = t3._last_poll_time
 with patch.object(MOD, "run_cli_async") as mock_async:
-    result = MOD.ProtonVPNTray._poll_status(t3)
+    result = MOD.ProtonVPNTray._poll_status(t3, force=True)
     check("6.3: poll proceeds after min interval elapsed",
           mock_async.called)
     check("6.3: _last_poll_time updated",
-          t3._last_poll_time > last)
+          t3._last_poll_time > before)
 
 # 6.4 idle_add triggered poll also respects rate limit
 t3._last_poll_time = None
@@ -317,6 +320,89 @@ t3._polling = False
 with patch.object(MOD, "run_cli_async") as mock_async:
     result = MOD.ProtonVPNTray._poll_status(t3)
     check("6.4: idle_add poll respects rate limit", mock_async.called)
+
+
+# ===================================================================
+# 6B. ADAPTIVE POLL BACKOFF — fewer expensive CLI spawns while idle
+# ===================================================================
+heading("6B. ADAPTIVE POLL BACKOFF")
+
+# 6B.1 Non-forced (timer) poll inside the backoff window is skipped, even once
+# the small POLL_MIN_INTERVAL has elapsed — this is what cuts idle CPU.
+tb = make_tray(MOD)
+tb._polling = False
+tb._poll_backoff = MOD.POLL_INTERVAL  # 20s window
+tb._last_poll_time = MOD._time.monotonic() - (MOD.POLL_MIN_INTERVAL + 0.1)
+with patch.object(MOD, "run_cli_async") as mock_async:
+    result = MOD.ProtonVPNTray._poll_status(tb)  # force defaults False
+    check("6B.1: timer poll skipped inside backoff window", not mock_async.called)
+    check("6B.1: skipped poll returns True (keeps timer alive)", result is True)
+
+# 6B.2 A forced poll inside the same window still proceeds and resets backoff.
+tb._polling = False
+tb._poll_backoff = MOD.POLL_INTERVAL_MAX
+with patch.object(MOD, "run_cli_async") as mock_async:
+    MOD.ProtonVPNTray._poll_status(tb, force=True)
+    check("6B.2: forced poll proceeds inside backoff window", mock_async.called)
+    check("6B.2: forced poll resets backoff to base",
+          tb._poll_backoff == MOD.POLL_INTERVAL)
+
+# 6B.3 Callback: unchanged state grows the backoff window toward the cap.
+tb2 = make_tray(MOD)
+tb2._polling = False
+tb2.connected = False
+tb2.signed_in = True
+tb2._poll_backoff = MOD.POLL_INTERVAL
+with patch.object(MOD, "run_cli_async") as mock_async:
+    MOD.ProtonVPNTray._poll_status(tb2)
+    cb = mock_async.call_args[0][2]
+    with patch.object(MOD.GLib, "idle_add") as mock_idle:
+        mock_idle.side_effect = lambda *a, **k: None
+        cb(0, "Status: Disconnected", "")  # state unchanged (still disconnected)
+    check("6B.3: unchanged state grows backoff",
+          tb2._poll_backoff == MOD.POLL_INTERVAL * 2)
+
+# 6B.4 Backoff growth saturates at POLL_INTERVAL_MAX (never exceeds the cap).
+tb2._polling = False
+tb2._poll_backoff = MOD.POLL_INTERVAL_MAX
+tb2._last_poll_time = None
+with patch.object(MOD, "run_cli_async") as mock_async:
+    MOD.ProtonVPNTray._poll_status(tb2)
+    cb = mock_async.call_args[0][2]
+    with patch.object(MOD.GLib, "idle_add") as mock_idle:
+        mock_idle.side_effect = lambda *a, **k: None
+        cb(0, "Status: Disconnected", "")
+    check("6B.4: backoff capped at POLL_INTERVAL_MAX",
+          tb2._poll_backoff == MOD.POLL_INTERVAL_MAX)
+
+# 6B.5 Callback: a state change snaps backoff straight back to the base.
+tb3 = make_tray(MOD)
+tb3._polling = False
+tb3.connected = False
+tb3.signed_in = True
+tb3._poll_backoff = MOD.POLL_INTERVAL_MAX
+tb3._last_poll_time = None
+with patch.object(MOD, "run_cli_async") as mock_async:
+    MOD.ProtonVPNTray._poll_status(tb3)
+    cb = mock_async.call_args[0][2]
+    with patch.object(MOD.GLib, "idle_add") as mock_idle:
+        mock_idle.side_effect = lambda *a, **k: None
+        cb(0, "Status: Connected\nServer: CH#1", "")  # now connected → changed
+    check("6B.5: state change resets backoff to base",
+          tb3._poll_backoff == MOD.POLL_INTERVAL)
+
+# 6B.6 _poll_now is a one-shot: forces a poll and returns False so GLib drops
+# the idle source instead of re-firing it every main-loop tick (the 100%-CPU
+# spin bug). See docs RCA 20260612.
+tb4 = make_tray(MOD)
+tb4._polling = False
+tb4._last_poll_time = None
+with patch.object(MOD.ProtonVPNTray, "_poll_status") as mock_poll:
+    ret = MOD.ProtonVPNTray._poll_now(tb4)
+    check("6B.6: _poll_now returns False (one-shot idle source)", ret is False)
+    check("6B.6: _poll_now calls _poll_status with force=True",
+          mock_poll.call_args.kwargs.get("force") is True
+          or (len(mock_poll.call_args.args) > 1 and mock_poll.call_args.args[1] is True))
 
 
 # ===================================================================
@@ -490,37 +576,50 @@ MOD.GLib.idle_add.side_effect = None
 heading("9. _cli_lock — Serializes concurrent CLI calls")
 
 # 9.1 Two concurrent calls block on lock
+MOD._failure_count = 0
+MOD._consecutive_timeouts = 0
 started_events = []
 completed_times = []
-locks_held = []
+lock_acquired = threading.Event()
+
+# Patched once in the main thread: nested per-thread patch.object() calls on
+# the same MOD.subprocess.Popen attribute race on context-manager exit
+# (thread 1 can restore the real subprocess.Popen while thread 2 is still
+# relying on the mock), causing thread 2 to spawn a real `protonvpn status`.
+def fake_popen(*a, **kw):
+    idx = 1 if not started_events else 2
+    started_events.append((idx, time.monotonic()))
+    if idx == 1:
+        lock_acquired.set()
+    mock = MagicMock()
+    mock.communicate.return_value = ("", "")
+    mock.returncode = 0
+    # simulate slow CLI: hold lock for 200ms
+    time.sleep(0.2)
+    return mock
 
 def make_cli_call(idx):
     def call():
-        def fake_popen(*a, **kw):
-            started = time.monotonic()
-            started_events.append((idx, started))
-            mock = MagicMock()
-            mock.communicate.return_value = ("", "")
-            mock.returncode = 0
-            # simulate slow CLI: hold lock for 100ms
-            time.sleep(0.1)
-            return mock
-        with patch.object(MOD.subprocess, "Popen", side_effect=fake_popen):
-            MOD.run_cli(["status"])
-            completed_times.append((idx, time.monotonic()))
+        MOD.run_cli(["status"])
+        completed_times.append((idx, time.monotonic()))
     return call
 
-t1 = threading.Thread(target=make_cli_call(1))
-t2 = threading.Thread(target=make_cli_call(2))
-t1.start()
-time.sleep(0.01)  # ensure t1 acquires lock first
-t2.start()
-t1.join(timeout=2)
-t2.join(timeout=2)
+with patch.object(MOD.subprocess, "Popen", side_effect=fake_popen):
+    t1 = threading.Thread(target=make_cli_call(1))
+    t2 = threading.Thread(target=make_cli_call(2))
+    t1.start()
+    lock_acquired.wait(timeout=5)  # wait until t1 acquires the lock
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
 
 check("9.1: first call started before second",
       len(started_events) >= 2 and
-      started_events[0][1] < started_events[1][1])
+      started_events[0][1] < started_events[1][1],
+      "events=%d t0=%.6f t1=%.6f" % (
+          len(started_events),
+          started_events[0][1] if started_events else 0,
+          started_events[1][1] if len(started_events) > 1 else 0))
 if len(completed_times) >= 2:
     check("9.1: calls completed sequentially (not interleaved)",
           completed_times[1][1] - completed_times[0][1] >= 0.05,
@@ -667,9 +766,10 @@ check("11.4: quitting flag set", t6._quitting is True)
 t6._quitting = False
 
 # 11.5 Indicator set_title fallback
+t6.indicator = MagicMock()
 has_set_title = hasattr(t6.indicator, "set_title")
 check("11.5: indicator supports set_title",
-      has_set_title)  # MagicMock supports everything
+      has_set_title)
 
 # 11.6 Indicator set_icon fallback
 has_set_icon = hasattr(t6.indicator, "set_icon")
@@ -864,26 +964,27 @@ except Exception as e:
 heading("16. _on_refresh — clears caches and triggers poll")
 
 t10 = make_tray(MOD)
-t10.countries_cache = [("CH", "Switzerland"), ("DE", "Germany")]
+t10.countries_cache = [("CH", "Switzerland"), ("IS", "Iceland")]
 t10.countries_loaded = True
 t10._config_cache = {"Kill Switch": "on"}
 t10._config_cache_time = time.time()
 
 with patch.object(MOD.ProtonVPNTray, "_poll_status") as mock_poll:
     with patch.object(MOD.ProtonVPNTray, "_load_countries_async") as mock_load:
-        MOD.ProtonVPNTray._on_refresh(t10, None)
-        check("16.1: refresh clears countries_cache",
-              t10.countries_cache == [])
-        check("16.2: refresh clears countries_loaded",
-              t10.countries_loaded is False)
-        check("16.3: refresh clears _config_cache",
-              t10._config_cache == {})
-        check("16.4: _config_cache_time reset",
-              t10._config_cache_time == 0)
-        check("16.5: poll triggered via idle_add",
-              mock_poll.called)
-        # Note: _load_countries_async is called via GLib.timeout_add(500ms)
-        # Can't easily verify this in the test since it's a timer
+        with patch.object(MOD.GLib, "idle_add", lambda cb: (cb(), 0)):
+            MOD.ProtonVPNTray._on_refresh(t10, None)
+            check("16.1: refresh clears countries_cache",
+                  t10.countries_cache == [])
+            check("16.2: refresh clears countries_loaded",
+                  t10.countries_loaded is False)
+            check("16.3: refresh clears _config_cache",
+                  t10._config_cache == {})
+            check("16.4: _config_cache_time reset",
+                  t10._config_cache_time == 0)
+            check("16.5: poll triggered via idle_add",
+                  mock_poll.called)
+            # Note: _load_countries_async is called via GLib.timeout_add(500ms)
+            # Can't easily verify this in the test since it's a timer
 
 
 # ===================================================================
